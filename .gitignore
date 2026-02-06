@@ -1,0 +1,62 @@
+# ========================
+# Environment & Secrets
+# ========================
+.env
+.env.local
+.env.*.local
+
+# ========================
+# Frontend (Next.js / Node)
+# ========================
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/coverage/
+frontend/.vercel/
+
+# ========================
+# Backend (Python / FastAPI)
+# ========================
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.venv/
+backend/venv/
+backend/*.egg-info/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/.pytest_cache/
+backend/coverage/
+backend/htmlcov/
+backend/.coverage
+backend/dist/
+
+# ========================
+# Docker
+# ========================
+docker/postgres_data/
+docker/redis_data/
+
+# ========================
+# IDE
+# ========================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# AI / Agent State
+# ========================
+.agents/
+.claude/
+.omc/
