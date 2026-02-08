@@ -30,7 +30,31 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         await db.flush()
         await db.refresh(db_obj)
         return db_obj
-    # get, get_multi, count, delete도 동일 패턴
+
+    async def get(self, db: AsyncSession, *, id: UUID) -> ModelType | None:
+        result = await db.execute(select(self.model).where(self.model.id == id))
+        return result.scalar_one_or_none()
+
+    async def get_multi(
+        self, db: AsyncSession, *, page: int = 1, size: int = 20,
+    ) -> Sequence[ModelType]:
+        offset = (page - 1) * size
+        result = await db.execute(
+            select(self.model).offset(offset).limit(size).order_by(self.model.created_at.desc())
+        )
+        return result.scalars().all()
+
+    async def count(self, db: AsyncSession) -> int:
+        result = await db.execute(select(func.count()).select_from(self.model))
+        return result.scalar_one()
+
+    async def delete(self, db: AsyncSession, *, id: UUID) -> bool:
+        obj = await self.get(db, id=id)
+        if obj is None:
+            return False
+        await db.delete(obj)
+        await db.flush()
+        return True
 ```
 
 ### 1.2 Settings
@@ -48,6 +72,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000", "http://frontend:3000"]
 
 settings = Settings()
 ```
@@ -230,18 +255,127 @@ async def client(db_session: AsyncSession):
 
 
 @pytest.fixture
-async def authenticated_client(client: AsyncClient):
-    """로그인된 클라이언트. 테스트 사용자 생성 후 인증 쿠키 설정."""
-    # 테스트 사용자 생성 + 로그인 → access_token 쿠키 설정
-    # 프로젝트에 맞게 구현
-    ...
+async def authenticated_client(client: AsyncClient, db_session: AsyncSession):
+    """로그인된 클라이언트. 테스트 사용자 생성 후 인증 헤더 설정."""
+    from app.core.security import hash_password, create_access_token
+    from app.models.user import User
+
+    user = User(
+        email="test@example.com",
+        name="Test User",
+        hashed_password=hash_password("testpassword123"),
+        is_active=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    await db_session.refresh(user)
+
+    access_token = create_access_token(user.id)
+    client.headers["Authorization"] = f"Bearer {access_token}"
+    yield client
+```
+
+### 1.7 Rate Limiting
+
+```python
+# core/rate_limit.py
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+```
+
+```python
+# main.py에 추가
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+
+from app.core.rate_limit import limiter
+
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "code": "RATE_LIMIT_EXCEEDED",
+                "message": "Too many requests. Please try again later.",
+                "details": None,
+            }
+        },
+    )
+```
+
+```python
+# api/v1/endpoints/auth.py에서 사용
+from app.core.rate_limit import limiter
+
+@router.post("/login", response_model=TokenResponse)
+@limiter.limit("5/minute")
+async def login(...): ...
+
+@router.post("/refresh", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def refresh(...): ...
 ```
 
 ---
 
-## 2. Auth
+## 2. Service 계층
 
-### 2.1 Auth 스키마
+### 2.1 UserService 참조 구현
+
+```python
+# services/user_service.py
+from uuid import UUID
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import ConflictException, NotFoundException
+from app.core.security import hash_password
+from app.models.user import User
+from app.repositories.user_repository import user_repository
+from app.schemas.user import UserCreate, UserUpdate
+
+
+async def create_user(db: AsyncSession, *, obj_in: UserCreate) -> User:
+    existing = await user_repository.get_by_email(db, email=obj_in.email)
+    if existing:
+        raise ConflictException(message="Email already registered")
+    obj_in_dict = obj_in.model_dump()
+    obj_in_dict["hashed_password"] = hash_password(obj_in_dict.pop("password"))
+    db_obj = User(**obj_in_dict)
+    db.add(db_obj)
+    await db.flush()
+    await db.refresh(db_obj)
+    return db_obj
+
+
+async def get_user(db: AsyncSession, *, user_id: UUID) -> User:
+    user = await user_repository.get(db, id=user_id)
+    if user is None:
+        raise NotFoundException(message="User not found")
+    return user
+
+
+async def update_user(db: AsyncSession, *, user_id: UUID, obj_in: UserUpdate) -> User:
+    user = await get_user(db, user_id=user_id)
+    return await user_repository.update(db, db_obj=user, obj_in=obj_in)
+```
+
+**핵심 원칙:**
+- Repository를 조합하여 비즈니스 로직 처리
+- 도메인 예외(`ConflictException`, `NotFoundException`)를 발생시켜 Router에 전달
+- 트랜잭션 관리는 `get_db()` 컨텍스트에 위임 (Service에서 commit/rollback 호출 금지)
+
+---
+
+## 3. Auth
+
+### 3.1 Auth 스키마
 
 ```python
 # schemas/auth.py
@@ -258,9 +392,15 @@ class TokenResponse(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+class TokenPayload(BaseModel):
+    sub: str          # user_id (UUID 문자열)
+    exp: int          # 만료 시각 (Unix timestamp)
+    iat: int          # 발급 시각 (Unix timestamp)
+    type: str         # "access"
 ```
 
-### 2.2 Auth 엔드포인트
+### 3.2 Auth 엔드포인트
 
 ```python
 # api/v1/endpoints/auth.py
@@ -294,36 +434,101 @@ async def logout(
     ...
 ```
 
-### 2.3 Security 함수 시그니처
+### 3.3 Security 함수 구현
 
 ```python
 # core/security.py
-def create_access_token(user_id: UUID) -> str: ...    # JWT 발급 (HS256, SECRET_KEY)
-def create_refresh_token() -> str: ...                 # UUID v4 생성
-def verify_access_token(token: str) -> dict: ...       # JWT 검증 (서명 + 만료 + type=="access")
-def verify_password(plain: str, hashed: str) -> bool: ...  # bcrypt (passlib)
-def hash_password(password: str) -> str: ...           # bcrypt (passlib)
+from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
+
+import jwt
+from passlib.context import CryptContext
+
+from app.core.config import settings
+from app.schemas.auth import TokenPayload
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+ALGORITHM = "HS256"
+
+
+def create_access_token(user_id: UUID) -> str:
+    """JWT access token 발급 (HS256, 15분 만료)"""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        "iat": now,
+        "type": "access",
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token() -> str:
+    """Refresh token 생성 (UUID v4)"""
+    return str(uuid4())
+
+
+def verify_access_token(token: str) -> TokenPayload:
+    """JWT 검증 → TokenPayload 반환 (dict 금지)"""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        token_data = TokenPayload(**payload)
+        if token_data.type != "access":
+            raise ValueError("Invalid token type")
+        return token_data
+    except (jwt.InvalidTokenError, ValueError) as e:
+        from app.core.exceptions import UnauthorizedException
+        raise UnauthorizedException(message="Invalid or expired token") from e
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """비밀번호 검증 (bcrypt)"""
+    return pwd_context.verify(plain, hashed)
+
+
+def hash_password(password: str) -> str:
+    """비밀번호 해싱 (bcrypt)"""
+    return pwd_context.hash(password)
 ```
 
-### 2.4 인증 의존성
+### 3.4 인증 의존성
 
 ```python
 # api/dependencies.py
+from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.security import verify_access_token
+from app.models.user import User
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
 
 async def get_current_user(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(oauth2_scheme),
 ) -> User:
-    # JWT에서 user_id 추출 → DB 조회 → is_active 확인
-    # 실패 시 401 UNAUTHORIZED
+    """JWT 검증 → User 조회 → is_active 확인"""
+    token_data = verify_access_token(token)
+    result = await db.execute(
+        select(User).where(User.id == token_data.sub)
+    )
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_active:
+        from app.core.exceptions import UnauthorizedException
+        raise UnauthorizedException(message="User not found or inactive")
+    return user
 ```
 
 ---
 
-## 3. Pydantic Schemas
+## 4. Pydantic Schemas
 
-### 3.1 Create / Update / Response 패턴
+### 4.1 Create / Update / Response 패턴
 
 ```python
 class UserCreate(BaseModel):
@@ -345,7 +550,7 @@ class UserResponse(BaseModel):
     updated_at: datetime
 ```
 
-### 3.2 PaginatedResponse 제네릭
+### 4.2 PaginatedResponse 제네릭
 
 ```python
 class PaginatedResponse(BaseModel, Generic[T]):

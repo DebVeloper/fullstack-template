@@ -75,6 +75,38 @@ test(backend): add auth service unit tests
 chore(docker): update postgres to 16.2
 ```
 
+### PR 리뷰 프로세스
+
+**브랜치 보호 규칙 (main, develop):**
+- PR을 통해서만 merge 가능 (직접 push 금지)
+- 최소 1명의 리뷰어 승인 필수
+- CI 통과 필수 (lint, type-check, test)
+- Squash merge 사용 (커밋 히스토리 정리)
+
+**PR 작성 규칙:**
+- 제목: Conventional Commits 형식 (`feat(backend): add user registration`)
+- 본문: 변경 사항 요약, 테스트 계획, 스크린샷(UI 변경 시)
+- 라벨: `frontend`, `backend`, `breaking` 등
+
+**리뷰 체크리스트:**
+- [ ] 코드 컨벤션 준수 ([CONVENTIONS.md](./CONVENTIONS.md), 영역별 문서)
+- [ ] 테스트 작성/통과 확인
+- [ ] 보안 취약점 없음 (OWASP Top 10)
+- [ ] API 변경 시 openapi-ts 재생성 확인
+- [ ] 마이그레이션 파일 포함 (DB 변경 시)
+
+### 릴리즈 프로세스
+
+```
+develop → main (PR merge) → 태그 생성 → 배포
+```
+
+1. `develop`에서 기능 개발 완료 및 QA
+2. `develop` → `main` PR 생성 및 리뷰
+3. merge 후 시맨틱 버전 태그 생성: `v{major}.{minor}.{patch}`
+4. GitHub Actions CD 파이프라인 자동 실행
+5. Hotfix: `main`에서 `hotfix/` 브랜치 분기 → `main`과 `develop` 모두에 merge
+
 ---
 
 ## 4. pre-commit Hooks
@@ -176,6 +208,30 @@ FastAPI 엔드포인트에 아래 메타데이터를 반드시 명시합니다:
 - `responses`: 주요 에러 응답 코드와 모델을 명시 (4xx, 5xx)
 - `summary`: 엔드포인트 설명 (한글 허용)
 
+### 5.6 JSON 필드 네이밍
+
+**Backend JSON 응답은 snake_case를 사용합니다.**
+
+Pydantic v2는 기본적으로 Python 필드명(snake_case)을 그대로 JSON 키로 사용합니다. camelCase 자동 변환(`alias_generator`)은 사용하지 않습니다.
+
+```json
+// ✅ 올바른 예시 (snake_case)
+{ "is_active": true, "created_at": "2024-01-01T00:00:00Z" }
+
+// ❌ 잘못된 예시 (camelCase)
+{ "isActive": true, "createdAt": "2024-01-01T00:00:00Z" }
+```
+
+**Frontend에서의 처리:**
+- openapi-ts가 생성하는 타입과 SDK는 Backend의 snake_case를 그대로 반영
+- Frontend 코드에서도 API 데이터 접근 시 snake_case 사용: `user.is_active`, `user.created_at`
+- camelCase ↔ snake_case 자동 변환 라이브러리 사용 금지 (타입 불일치 유발)
+
+**범위:**
+- API 요청/응답 body: snake_case
+- Query parameter: snake_case (`?sort_by=created_at&is_active=true`)
+- URL path: kebab-case (`/api/v1/auth/login`) — [§1 네이밍 규칙](#1-네이밍-규칙) 참조
+
 ---
 
 ## 6. 테스팅 원칙
@@ -205,6 +261,34 @@ FastAPI 엔드포인트에 아래 메타데이터를 반드시 명시합니다:
 | Frontend E2E (Playwright) | 주요 사용자 흐름 100% |
 
 영역별 테스트 설정은 [CONVENTIONS-BACKEND.md §8](./CONVENTIONS-BACKEND.md#8-테스팅-pytest)과 [CONVENTIONS-FRONTEND.md §7](./CONVENTIONS-FRONTEND.md#7-테스팅)을 참조하세요.
+
+### 6.3 통합 테스트 전략
+
+**FE↔BE 통합 검증은 Playwright E2E 테스트가 담당합니다.**
+
+```
+E2E 테스트 환경:
+  Docker Compose (frontend + backend + db + redis)
+  ↓
+  Playwright → Browser → Next.js(BFF) → FastAPI → PostgreSQL/Redis
+```
+
+| 테스트 유형 | 도구 | 대상 | 환경 |
+|------------|------|------|------|
+| Frontend 단위 | vitest + RTL + MSW | 컴포넌트, 훅 | jsdom (모킹) |
+| Backend 단위 | pytest + httpx | Repository, Service | 테스트 DB |
+| Backend API 통합 | pytest + AsyncClient | 엔드포인트 전체 경로 | 테스트 DB + Redis |
+| FE↔BE 통합 (E2E) | Playwright | 전체 사용자 흐름 | Docker Compose |
+
+**Backend API 통합 테스트:**
+- `httpx.AsyncClient` + `ASGITransport`로 FastAPI 앱 전체를 테스트
+- DB, Redis 실제 연결 (테스트 DB 사용)
+- 매 테스트마다 `create_all` / `drop_all`로 격리
+
+**E2E 통합 테스트:**
+- CI에서 `docker compose up` 후 Playwright 실행
+- 주요 사용자 시나리오: 회원가입 → 로그인 → 인증된 페이지 접근 → 로그아웃
+- 인증 흐름, 에러 처리, 페이지 네비게이션 검증
 
 ---
 

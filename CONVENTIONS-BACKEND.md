@@ -70,7 +70,7 @@ async def get_me(
 
 Create / Update / Response 스키마를 분리합니다.
 
-구현 코드는 [SPECS-BACKEND.md §3](./SPECS-BACKEND.md#3-pydantic-schemas)를 참조하세요.
+구현 코드는 [SPECS-BACKEND.md §4](./SPECS-BACKEND.md#4-pydantic-schemas)를 참조하세요.
 
 **규칙:**
 - `model_config = ConfigDict(from_attributes=True)` 사용 (Response 스키마)
@@ -83,7 +83,7 @@ Create / Update / Response 스키마를 분리합니다.
 ## 4. JWT 인증 상세
 
 인증 흐름 및 토큰 구조는 [ARCHITECTURE.md §4.2](./ARCHITECTURE.md#42-jwt-인증-흐름)를 참조하세요.
-Security 함수 시그니처와 인증 의존성 코드는 [SPECS-BACKEND.md §2](./SPECS-BACKEND.md#2-auth)를 참조하세요.
+Security 함수 구현과 인증 의존성 코드는 [SPECS-BACKEND.md §3](./SPECS-BACKEND.md#3-auth)를 참조하세요.
 
 **인증 규칙:**
 - 토큰 구성 및 흐름은 [ARCHITECTURE.md §4.2](./ARCHITECTURE.md#42-jwt-인증-흐름) 참조
@@ -154,3 +154,25 @@ tests/
 - 파일: `test_{module}.py`
 - 함수: `test_{action}_{condition}_{expected}` (예: `test_create_user_with_valid_data_returns_201`)
 - fixture: 명사형 (`db_session`, `authenticated_client`)
+
+---
+
+## 9. Rate Limiting
+
+인증 엔드포인트에 IP 기반 rate limiting을 적용합니다.
+
+**라이브러리:** `slowapi` (FastAPI 전용)
+
+**적용 대상 및 제한:**
+
+| 엔드포인트 | 제한 | 근거 |
+|-----------|------|------|
+| `POST /api/v1/auth/login` | 5/minute | brute-force 방어 |
+| `POST /api/v1/auth/refresh` | 10/minute | silent refresh 동시 요청 고려 |
+
+**규칙:**
+- `slowapi.Limiter`를 `get_remote_address` key_func으로 초기화
+- 인증 엔드포인트에만 `@limiter.limit()` 데코레이터 적용
+- 429 응답도 프로젝트 통합 에러 포맷(`ErrorResponse`)을 따름
+- 운영 환경에서는 Redis 스토리지 백엔드 사용 (다중 인스턴스 대응)
+- 구현 코드는 [SPECS-BACKEND.md §1.7](./SPECS-BACKEND.md#17-rate-limiting) 참조

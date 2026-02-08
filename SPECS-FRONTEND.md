@@ -9,12 +9,15 @@
 
 ### 1.1 BFF 프록시
 
+BFF 프록시는 Backend에서 401 응답을 받으면 자동으로 토큰 갱신을 시도합니다 (Silent Refresh). 갱신 성공 시 새 쿠키를 설정하고 원래 요청을 재시도합니다. 갱신 실패 시 쿠키를 삭제하고 401을 클라이언트에 전달합니다.
+
 ```typescript
 // frontend/src/app/api/[...path]/route.ts
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -44,14 +47,64 @@ async function proxyRequest(req: NextRequest) {
     headers.set("Authorization", `Bearer ${accessToken}`);
   }
 
+  // 요청 body를 재사용 가능하도록 버퍼링
+  let bodyBuffer: ArrayBuffer | null = null;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    bodyBuffer = await req.arrayBuffer();
+  }
+
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       method: req.method,
       headers,
-      body: req.method !== "GET" && req.method !== "HEAD"
-        ? req.body
-        : undefined,
+      body: bodyBuffer,
     });
+
+    // 401이고 refresh_token이 있으면 자동 갱신 시도
+    if (response.status === 401) {
+      const refreshToken = cookieStore.get("refresh_token")?.value;
+      if (refreshToken) {
+        const refreshResponse = await fetch(
+          `${BACKEND_URL}/api/v1/auth/refresh`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ refresh_token: refreshToken }),
+          },
+        );
+
+        if (refreshResponse.ok) {
+          const tokens = await refreshResponse.json();
+
+          cookieStore.set("access_token", tokens.access_token, {
+            httpOnly: true,
+            secure: IS_PRODUCTION,
+            sameSite: "lax",
+            path: "/",
+            maxAge: 900,
+          });
+          cookieStore.set("refresh_token", tokens.refresh_token, {
+            httpOnly: true,
+            secure: IS_PRODUCTION,
+            sameSite: "lax",
+            path: "/api/auth",
+            maxAge: 604800,
+          });
+
+          // 새 access_token으로 원래 요청 재시도
+          headers.set("Authorization", `Bearer ${tokens.access_token}`);
+          response = await fetch(url, {
+            method: req.method,
+            headers,
+            body: bodyBuffer,
+          });
+        } else {
+          // refresh 실패 → 쿠키 삭제, 401 그대로 전달
+          cookieStore.delete("access_token");
+          cookieStore.delete("refresh_token");
+        }
+      }
+    }
 
     return new NextResponse(response.body, {
       status: response.status,
@@ -271,6 +324,44 @@ export function renderWithProviders(
 }
 ```
 
+### 1.7 인증 미들웨어
+
+```typescript
+// frontend/src/middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const AUTH_ROUTES = ["/dashboard", "/settings"];
+const PUBLIC_ONLY_ROUTES = ["/login", "/register"];
+
+export function middleware(req: NextRequest) {
+  const accessToken = req.cookies.get("access_token")?.value;
+  const { pathname } = req.nextUrl;
+
+  // 인증 필요 라우트에 미인증 접근 → /login 리다이렉트
+  const isAuthRoute = AUTH_ROUTES.some((route) => pathname.startsWith(route));
+  if (isAuthRoute && !accessToken) {
+    const loginUrl = new URL("/login", req.url);
+    loginUrl.searchParams.set("callbackUrl", pathname);
+    return NextResponse.redirect(loginUrl);
+  }
+
+  // 로그인된 사용자가 공개 전용 라우트 접근 → /dashboard 리다이렉트
+  const isPublicOnly = PUBLIC_ONLY_ROUTES.some((route) => pathname.startsWith(route));
+  if (isPublicOnly && accessToken) {
+    return NextResponse.redirect(new URL("/dashboard", req.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    // static files, _next, api 제외
+    "/((?!_next/static|_next/image|favicon.ico|api/).*)",
+  ],
+};
+```
+
 ---
 
 ## 2. openapi-ts 연결
@@ -302,9 +393,22 @@ export default defineConfig({
 ```typescript
 // frontend/src/lib/api-client.ts
 import { createClient } from "@hey-api/client-fetch";
+import { ApiError } from "./api-error";
 
 export const apiClient = createClient({
   baseUrl: "/api",   // BFF 프록시 경유 — Backend URL 직접 사용 금지
+  throwOnError: true, // 4xx/5xx 응답 시 에러 throw
+});
+
+// SDK 에러 → ApiError 변환 인터셉터
+apiClient.interceptors.response.use((response) => {
+  if (response.status >= 400) {
+    const body = response.data as { error?: { code: string; message: string; details: unknown } };
+    if (body?.error) {
+      throw new ApiError(response.status, body.error);
+    }
+  }
+  return response;
 });
 ```
 
@@ -390,7 +494,7 @@ export async function parseApiError(response: Response): Promise<ApiError> {
 // frontend/src/lib/query-client.ts
 import { QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { ApiError } from "./api-error";
+import { ApiError } from "./api-error";
 
 export function createQueryClient() {
   return new QueryClient({
@@ -399,12 +503,15 @@ export function createQueryClient() {
       mutations: {
         retry: false,
         onError: (error) => {
-          const apiError = error as ApiError;
-          if (apiError.code === "UNAUTHORIZED") {
-            window.location.href = "/login";
+          if (error instanceof ApiError) {
+            if (error.status === 401) {
+              window.location.href = "/login";
+              return;
+            }
+            toast.error(error.message);
             return;
           }
-          toast.error(apiError.message ?? "오류가 발생했습니다.");
+          toast.error("오류가 발생했습니다.");
         },
       },
     },
@@ -422,10 +529,8 @@ async function onSubmit(data: UserCreate) {
   try {
     await mutation.mutateAsync(data);
   } catch (error) {
-    const apiError = error as ApiError;
-    if (apiError.isValidationError) {
-      const fieldErrors = apiError.fieldErrors;
-      // React Hook Form 연동: setError("email", { message: fieldErrors.email })
+    if (error instanceof ApiError && error.isValidationError) {
+      const fieldErrors = error.fieldErrors;
       Object.entries(fieldErrors).forEach(([field, message]) => {
         form.setError(field as keyof UserCreate, { message });
       });

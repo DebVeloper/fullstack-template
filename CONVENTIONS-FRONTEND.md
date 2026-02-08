@@ -49,6 +49,7 @@ src/app/
 | `loading.tsx` | Suspense 폴백 (Skeleton UI) |
 | `error.tsx` | Error Boundary (`'use client'` 필수) |
 | `not-found.tsx` | 404 페이지 |
+| `middleware.ts` | 라우트 보호 (인증 체크, 리다이렉트) |
 
 **Server / Client Component 전략:**
 
@@ -65,6 +66,9 @@ src/app/
 **Next.js 15 비동기 API:**
 - `cookies()`, `headers()`, `params`, `searchParams`는 모두 비동기 — `await` 필수
 - React 19: `forwardRef` 대신 `ref`를 prop으로 직접 전달
+
+**인증 라우트 보호:**
+`middleware.ts`로 인증 라우트를 보호합니다. 구현 코드는 [SPECS-FRONTEND.md §1.7](./SPECS-FRONTEND.md#17-인증-미들웨어)을 참조하세요.
 
 ---
 

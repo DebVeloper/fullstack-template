@@ -4,13 +4,42 @@
 
 이 프로젝트는 풀스택 웹 서비스를 빠르게 시작하기 위한 **재사용 가능한 프로젝트 템플릿**입니다.
 
-### 사용법
+### Quick Start
 
 ```bash
+# 1. 프로젝트 클론
 git clone https://github.com/debveloper/fullstack-template.git my-project
 cd my-project
-# 프로젝트명에 맞게 설정 변경 후 개발 시작
+
+# 2. 환경변수 설정
+cp .env.example .env
+# .env 파일을 열어 SECRET_KEY 등 필수 값 설정
+
+# 3. 개발 환경 실행
+docker compose up -d
+
+# 4. DB 마이그레이션
+docker compose exec backend alembic upgrade head
+
+# 5. 접속 확인
+# Frontend: http://localhost:3000
+# Backend API 문서: http://localhost:8000/docs
+# PostgreSQL: localhost:5432
+# Redis: localhost:6379
 ```
+
+**주요 명령어:**
+
+| 명령어 | 설명 |
+|--------|------|
+| `docker compose up -d` | 전체 서비스 시작 |
+| `docker compose down` | 전체 서비스 중지 |
+| `docker compose logs -f backend` | Backend 로그 확인 |
+| `docker compose exec backend alembic revision --autogenerate -m "msg"` | DB 마이그레이션 생성 |
+| `docker compose exec backend pytest` | Backend 테스트 실행 |
+| `docker compose exec frontend npm test` | Frontend 테스트 실행 |
+| `docker compose exec frontend npx playwright test` | E2E 테스트 실행 |
+| `docker compose exec frontend npm run generate:api` | openapi-ts 타입 재생성 |
 
 ### 관련 문서
 
@@ -72,7 +101,8 @@ fullstack-template/
 │   │   │   └── queries/         # TanStack Query 커스텀 훅
 │   │   ├── lib/                 # 유틸리티, API 클라이언트
 │   │   ├── client/              # openapi-ts 자동 생성 (수동 수정 금지)
-│   │   └── types/               # TypeScript 타입 정의
+│   │   ├── types/               # TypeScript 타입 정의
+│   │   └── middleware.ts        # 인증 라우트 보호 미들웨어
 │   ├── e2e/                     # Playwright E2E 테스트
 │   ├── public/                  # 정적 파일
 │   ├── next.config.ts
@@ -94,7 +124,8 @@ fullstack-template/
 │   │   │   ├── config.py        # 환경변수 설정
 │   │   │   ├── security.py      # JWT, 비밀번호 해싱
 │   │   │   ├── database.py      # DB 엔진 & 세션
-│   │   │   └── exceptions.py    # 커스텀 예외 계층
+│   │   │   ├── exceptions.py    # 커스텀 예외 계층
+│   │   │   └── rate_limit.py    # Rate Limiting (slowapi)
 │   │   ├── models/              # SQLAlchemy 모델
 │   │   │   ├── base.py          # Base, TimestampMixin
 │   │   │   └── user.py
@@ -298,6 +329,50 @@ alembic upgrade head
 # 롤백
 alembic downgrade -1
 ```
+
+### 4.5 보안
+
+#### Security Headers
+
+Next.js `next.config.ts`에서 보안 헤더를 설정합니다. FastAPI는 BFF 뒤에 있으므로 브라우저와 직접 통신하지 않아, 보안 헤더는 Next.js에서만 설정합니다.
+
+| 헤더 | 값 | 목적 |
+|------|-----|------|
+| `X-Content-Type-Options` | `nosniff` | MIME 스니핑 방지 |
+| `X-Frame-Options` | `DENY` | Clickjacking 방지 |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Referer 정보 제한 |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | 불필요한 브라우저 API 차단 |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | HTTPS 강제 (운영) |
+| `Content-Security-Policy` | `default-src 'self'; ...` | XSS/인젝션 방어 |
+
+설정 파일: `frontend/next.config.ts`
+
+#### CORS (FastAPI)
+
+Backend의 CORS 설정은 `Settings.ALLOWED_ORIGINS`로 관리합니다.
+
+| 환경 | 허용 Origin |
+|------|------------|
+| 개발 | `http://localhost:3000`, `http://frontend:3000` |
+| 운영 | 운영 도메인만 명시 (예: `https://yourdomain.com`) |
+
+**규칙:**
+- `allow_origins: ["*"]`는 운영 환경에서 **금지**
+- `allow_credentials: True` (쿠키 전송 허용)
+- `allow_methods`: `GET`, `POST`, `PATCH`, `DELETE` (PUT 미사용)
+
+설정 파일: `backend/app/main.py`, `backend/app/core/config.py`
+
+#### CSRF 방어
+
+이 프로젝트는 별도 CSRF 토큰 없이 다중 계층 방어를 사용합니다:
+
+| 방어 계층 | 설명 |
+|-----------|------|
+| `SameSite=lax` 쿠키 | cross-site POST 요청에 쿠키 미전송 |
+| BFF 프록시 | 클라이언트 → Next.js(동일 origin) → Backend |
+| CORS | Backend는 허용된 origin만 접근 가능 |
+| `Content-Type: application/json` | 단순 form 제출 불가 (CORS preflight 트리거) |
 
 ---
 
