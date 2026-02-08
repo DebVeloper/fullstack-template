@@ -64,6 +64,8 @@ docker compose exec backend alembic upgrade head
 | | TanStack Query | v5 | 서버 상태 관리 |
 | | Tailwind CSS | v4 | 유틸리티 퍼스트 |
 | | shadcn/ui | latest | 컴포넌트 라이브러리 |
+| | react-hook-form | latest | 폼 상태 관리 + 유효성 검사 |
+| | zod | latest | 스키마 기반 폼 유효성 검사 (zodResolver) |
 | | openapi-ts | latest | API 클라이언트/타입 자동 생성 |
 | **Backend** | FastAPI | 0.115+ | async 기반 |
 | | Pydantic | v2 | 데이터 검증 |
@@ -92,15 +94,20 @@ fullstack-template/
 │   │   │   ├── (auth)/          # 인증 필요 라우트 그룹
 │   │   │   ├── (public)/        # 공개 라우트 그룹
 │   │   │   ├── api/             # BFF API Routes (프록시)
+│   │   │   │   └── auth/
+│   │   │   │       └── register/
 │   │   │   ├── layout.tsx       # 루트 레이아웃
 │   │   │   └── page.tsx         # 홈페이지
 │   │   ├── components/
 │   │   │   ├── ui/              # shadcn/ui 기본 컴포넌트
 │   │   │   ├── features/        # 비즈니스 로직 컴포넌트
+│   │   │   │   └── auth/        # 인증 관련 컴포넌트
 │   │   │   └── layouts/         # 레이아웃 컴포넌트
 │   │   ├── hooks/
 │   │   │   └── queries/         # TanStack Query 커스텀 훅
+│   │   │       └── use-auth.ts
 │   │   ├── lib/                 # 유틸리티, API 클라이언트
+│   │   │   └── error-messages.ts
 │   │   ├── client/              # openapi-ts 자동 생성 (수동 수정 금지)
 │   │   ├── types/               # TypeScript 타입 정의
 │   │   └── middleware.ts        # 인증 라우트 보호 미들웨어
@@ -242,6 +249,13 @@ Token Family 패턴으로 토큰 탈취를 조기 감지합니다.
 | 토큰은 있지만 family의 현재 토큰과 불일치 | **탈취 확정** — 정상 사용자는 새 토큰을 받았는데 구 토큰이 재사용됨 | 해당 사용자의 **모든 세션 무효화** (user_families의 모든 family 삭제) → 401 + "Token reuse detected. All sessions revoked." |
 | 토큰과 family 토큰이 일치 | 정상 요청 | Rotation 수행 (기존 삭제 → 신규 발급) |
 
+**Grace Period (서버리스 환경 대응):**
+Refresh Token Rotation 시, rotation된 구 토큰은 즉시 삭제되지 않고 **10초간 유예기간**이 적용됩니다.
+서버리스 환경(Vercel 등)에서 여러 인스턴스가 동시에 같은 refresh_token으로 요청할 수 있으며,
+BFF의 Promise 캐싱은 같은 인스턴스 내에서만 동작합니다. Grace period 내의 구 토큰 사용은
+replay 공격이 아닌 정상적인 동시 요청으로 처리됩니다.
+참조 구현: [SPECS-BACKEND.md §2.2](./SPECS-BACKEND.md#22-authservice-참조-구현)
+
 **참조 구현:** [SPECS-BACKEND.md §2.2](./SPECS-BACKEND.md#22-authservice-참조-구현)
 
 **쿠키 전략 — BFF 주도 설정:**
@@ -252,6 +266,11 @@ Backend는 JSON body로 토큰을 반환하고, BFF(Next.js API Route)가 쿠키
 |------|-----|----------|--------|----------|------|--------|
 | `access_token` | JWT 문자열 | true | true (prod) | lax | `/` | 15분 (900초) |
 | `refresh_token` | UUID v4 | true | true (prod) | lax | `/api/auth` | 7일 (604800초) |
+
+> **refresh_token path 제한 (`/api/auth`):** 브라우저는 `path=/api/auth` 쿠키를 `/api/auth/*` 요청에만 자동 전송합니다.
+> 그러나 BFF 프록시의 Silent Refresh는 Next.js 서버 사이드에서 실행되므로, `cookies()` API를 통해
+> path와 무관하게 모든 쿠키에 접근할 수 있습니다. 이 설계는 보안(불필요한 쿠키 전송 방지)과
+> 기능(Silent Refresh)을 모두 충족합니다.
 
 - **Backend 응답**: `TokenResponse { access_token, refresh_token, token_type }` (JSON body)
 - **BFF 역할**: Backend 응답 수신 → `Set-Cookie` 헤더로 httpOnly 쿠키 설정 → 클라이언트에 전달
@@ -298,6 +317,20 @@ Backend는 JSON body로 토큰을 반환하고, BFF(Next.js API Route)가 쿠키
                                               ├─ Redis에서 Refresh Token 삭제
                                               │
    Client ◀── Clear-Cookie ◀── BFF ◀─────────┘
+
+5. 회원가입 (자동 로그인)
+   Client ──POST /api/auth/register──▶ BFF ──▶ FastAPI
+                                                  │
+                                                  ├─ UserCreate 스키마 검증
+                                                  ├─ 이메일 중복 확인
+                                                  ├─ 비밀번호 해싱 + 사용자 생성
+                                                  │
+                                              BFF ◀──┘ (UserResponse)
+                                                  │
+                                                  ├─ BFF가 동일 credentials로 login API 호출
+                                                  ├─ 토큰 수신 → 쿠키 설정
+                                                  │
+   Client ◀── Set-Cookie(httpOnly) ◀── BFF ◀──┘
 ```
 
 ### 4.3 에러 핸들링

@@ -154,6 +154,7 @@ Backend의 OpenAPI 스펙에서 타입과 API 클라이언트를 자동 생성�
 - Backend 스키마 변경 시 반드시 재생성 (`npm run generate:api`)
 - 생성된 타입을 TanStack Query 커스텀 훅에서 import하여 사용
 - 수동 API 타입 정의 금지
+- Auth 요청(로그인, 회원가입, 토큰 갱신, 로그아웃)은 openapi-ts SDK를 사용하지 않고 BFF 전용 라우트(`/api/auth/*`)를 `fetch()`로 직접 호출 — SDK의 auth 함수는 BFF를 우회하여 쿠키가 설정되지 않음
 
 ---
 

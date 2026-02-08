@@ -46,6 +46,10 @@ async def get_me(
 - 테스트에서 `app.dependency_overrides`로 교체 가능하게 설계
 - 직접 세션 생성 금지 (`AsyncSessionLocal()` 등) — 반드시 `Depends(get_db)` 사용
 
+**3-Layer 예외 규칙:**
+- 인증 의존성(`get_current_user`)은 횡단 관심사이므로, Service 계층을 경유하지 않고 **Repository를 직접 호출**하여 사용자를 조회합니다 ([SPECS-BACKEND.md §3.4](./SPECS-BACKEND.md#34-인증-의존성) 참조)
+- 단, 비즈니스 로직(활성 상태 확인 외의 복잡한 로직)은 포함하지 않습니다
+
 ---
 
 ## 2. 엔드포인트 생성 순서

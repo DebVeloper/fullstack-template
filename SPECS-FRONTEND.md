@@ -13,11 +13,13 @@ BFF 프록시는 Backend에서 401 응답을 받으면 자동으로 토큰 갱�
 
 **BFF 경로 변환 규칙:**
 
-| 클라이언트 요청 | BFF 변환 | Backend 도착 |
-|----------------|----------|-------------|
-| `GET /api/users/me` | `/api` 제거 → `/users/me` | `BACKEND_URL/api/v1/users/me` |
-| `POST /api/users` | `/api` 제거 → `/users` | `BACKEND_URL/api/v1/users` |
-| `GET /api/users?page=1` | query string 유지 | `BACKEND_URL/api/v1/users?page=1` |
+openapi-ts SDK가 생성하는 경로에는 `/v1/` prefix가 포함되므로(OpenAPI 스펙 기준), BFF 프록시는 `/api/` 이후의 전체 경로를 그대로 Backend에 전달합니다.
+
+| 클라이언트 요청 (SDK) | BFF 캡처 (path) | Backend 도착 |
+|---|---|---|
+| `GET /api/v1/users/me` | `v1/users/me` | `BACKEND_URL/api/v1/users/me` |
+| `POST /api/v1/users` | `v1/users` | `BACKEND_URL/api/v1/users` |
+| `GET /api/v1/users?page=1` | `v1/users` + `?page=1` | `BACKEND_URL/api/v1/users?page=1` |
 
 인증 전용 라우트(`/api/auth/*`)는 `[...path]` catch-all에 도달하기 전에 전용 Route Handler(`/api/auth/login/route.ts` 등)가 먼저 매칭됩니다.
 
@@ -58,6 +60,9 @@ function filterHeaders(headers: Headers): Headers {
 // 이 모듈 레벨 변수는 인스턴스 간 공유되지 않습니다.
 // 같은 인스턴스 내 동시 요청에 대한 dedup 역할만 수행합니다.
 // 이는 의도된 설계이며, 다른 인스턴스의 중복 refresh는 Token Rotation으로 안전하게 처리됩니다.
+// NOTE: Backend의 refresh rotation에 10초 grace period가 적용되어 있어,
+// 서버리스 환경에서 여러 인스턴스가 동시에 같은 refresh_token으로 요청하더라도
+// grace period 내에는 정상 처리됩니다 (SPECS-BACKEND.md §2.2 참조).
 let refreshPromise: Promise<RefreshResult> | null = null;
 
 interface RefreshResult {
@@ -98,8 +103,11 @@ async function refreshTokens(currentRefreshToken: string): Promise<RefreshResult
 }
 
 async function proxyRequest(req: NextRequest) {
-  const path = req.nextUrl.pathname.replace(/^\/api/, "");
-  const url = `${BACKEND_URL}/api/v1${path}${req.nextUrl.search}`;
+  const path = req.nextUrl.pathname.replace(/^\/api\//, "");
+  const search = req.nextUrl.search;
+  const url = `${BACKEND_URL}/api/${path}${search}`;
+  // openapi-ts SDK가 /api/v1/ prefix를 포함하므로
+  // catch-all path = "v1/users" → Backend URL = "BACKEND_URL/api/v1/users"
 
   const cookieStore = await cookies();
   const accessToken = cookieStore.get("access_token")?.value;
@@ -152,6 +160,12 @@ async function proxyRequest(req: NextRequest) {
             headers,
             body: bodyBuffer,
           });
+
+          // 재시도 후에도 401이면 쿠키 삭제 (사용자 비활성화 등의 사유)
+          if (response.status === 401) {
+            cookieStore.delete("access_token");
+            cookieStore.delete("refresh_token");
+          }
         } else {
           // refresh 실패 → 쿠키 삭제, 401 그대로 전달
           cookieStore.delete("access_token");
@@ -181,6 +195,11 @@ export const DELETE = proxyRequest;
 ### 1.2 BFF 인증 라우트
 
 Backend는 JSON body로 토큰을 반환하고, BFF가 쿠키를 설정합니다. 클라이언트에는 토큰을 노출하지 않습니다.
+
+> **쿠키 path 전략:** `refresh_token`의 path를 `/api/auth`로 제한하여 일반 API 요청에 불필요하게 전송되지 않도록 합니다.
+> BFF 프록시(`[...path]/route.ts`)에서 Silent Refresh 시 `cookies()`로 refresh_token을 읽는 것은 서버 사이드에서 실행되므로
+> 브라우저의 쿠키 path 제한과 무관하게 모든 쿠키에 접근할 수 있습니다.
+> 즉, `path=/api/auth`는 브라우저→서버 전송만 제한하고, 서버 사이드의 `cookies()` API 접근은 제한하지 않습니다.
 
 ```typescript
 // frontend/src/app/api/auth/login/route.ts
@@ -309,6 +328,64 @@ export async function POST() {
 }
 ```
 
+```typescript
+// src/app/api/auth/register/route.ts
+import { cookies } from "next/headers";
+import { NextRequest, NextResponse } from "next/server";
+
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+
+  // 1. Backend에 회원가입 요청
+  const registerRes = await fetch(`${BACKEND_URL}/api/v1/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!registerRes.ok) {
+    const error = await registerRes.json();
+    return NextResponse.json(error, { status: registerRes.status });
+  }
+
+  // 2. 회원가입 성공 → 자동 로그인 (같은 credentials로 로그인)
+  const loginRes = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: body.email, password: body.password }),
+  });
+
+  if (!loginRes.ok) {
+    // 회원가입은 성공했지만 자동 로그인 실패 — 사용자에게 로그인 페이지 안내
+    return NextResponse.json({ registered: true, autoLogin: false }, { status: 201 });
+  }
+
+  const tokens = await loginRes.json();
+  const cookieStore = await cookies();
+
+  // 3. 쿠키 설정 (login route와 동일)
+  cookieStore.set("access_token", tokens.access_token, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 900,
+  });
+  cookieStore.set("refresh_token", tokens.refresh_token, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: "lax",
+    path: "/api/auth",
+    maxAge: 604800,
+  });
+
+  return NextResponse.json({ registered: true, autoLogin: true });
+}
+```
+
 **Login 후 사용자 정보 획득 흐름:**
 
 1. `POST /api/auth/login` (BFF) 성공 → 쿠키 설정 완료
@@ -398,6 +475,19 @@ export function renderWithProviders(
   }
 
   return render(ui, { wrapper: Wrapper, ...options });
+}
+
+/** renderHook용 wrapper 생성 함수 */
+export function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
+  return function Wrapper({ children }: { children: React.ReactNode }) {
+    return (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+  };
 }
 ```
 
@@ -626,6 +716,248 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
+### 1.10 에러/로딩 UI
+
+#### error.tsx (글로벌 에러 바운더리)
+
+```typescript
+// src/app/error.tsx
+"use client";
+
+interface ErrorPageProps {
+  error: Error & { digest?: string };
+  reset: () => void;
+}
+
+export default function Error({ error, reset }: ErrorPageProps) {
+  return (
+    <div className="flex min-h-[400px] flex-col items-center justify-center gap-4">
+      <h2 className="text-xl font-semibold">문제가 발생했습니다</h2>
+      <p className="text-muted-foreground">{error.message}</p>
+      <button
+        onClick={reset}
+        className="rounded-md bg-primary px-4 py-2 text-primary-foreground hover:bg-primary/90"
+      >
+        다시 시도
+      </button>
+    </div>
+  );
+}
+```
+
+#### loading.tsx (글로벌 로딩)
+
+```typescript
+// src/app/loading.tsx
+import { Skeleton } from "@/components/ui/skeleton";
+
+export default function Loading() {
+  return (
+    <div className="space-y-4 p-6">
+      <Skeleton className="h-8 w-1/3" />
+      <Skeleton className="h-4 w-2/3" />
+      <Skeleton className="h-4 w-1/2" />
+      <div className="grid grid-cols-3 gap-4 pt-4">
+        <Skeleton className="h-32" />
+        <Skeleton className="h-32" />
+        <Skeleton className="h-32" />
+      </div>
+    </div>
+  );
+}
+```
+
+### 1.11 로그인 폼 컴포넌트
+
+Auth 요청은 BFF 전용 라우트(`/api/auth/*`)를 직접 fetch로 호출합니다. openapi-ts SDK는 사용하지 않습니다.
+
+```typescript
+// src/components/features/auth/login-form.tsx
+"use client";
+
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useState } from "react";
+import { toast } from "sonner";
+import { ApiError } from "@/lib/api-error";
+
+const loginSchema = z.object({
+  email: z.string().email("올바른 이메일을 입력하세요"),
+  password: z.string().min(1, "비밀번호를 입력하세요"),
+});
+
+type LoginFormValues = z.infer<typeof loginSchema>;
+
+export function LoginForm() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const callbackUrl = searchParams.get("callbackUrl") ?? "/dashboard";
+  const [isLoading, setIsLoading] = useState(false);
+
+  const form = useForm<LoginFormValues>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: { email: "", password: "" },
+  });
+
+  async function onSubmit(data: LoginFormValues) {
+    setIsLoading(true);
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const body = await res.json();
+        throw new ApiError(res.status, body.error);
+      }
+      router.push(callbackUrl);
+      router.refresh();
+    } catch (error) {
+      if (error instanceof ApiError) {
+        if (error.isValidationError) {
+          Object.entries(error.fieldErrors).forEach(([field, message]) => {
+            form.setError(field as keyof LoginFormValues, { message });
+          });
+        } else {
+          toast.error(error.message);
+        }
+      } else {
+        toast.error("로그인 중 오류가 발생했습니다.");
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  return (
+    <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+      {/* 실제 UI는 shadcn/ui Form 컴포넌트 사용 권장 */}
+      <div>{/* email input */}</div>
+      <div>{/* password input */}</div>
+      <button type="submit" disabled={isLoading}>
+        {isLoading ? "로그인 중..." : "로그인"}
+      </button>
+    </form>
+  );
+}
+```
+
+**useLogin / useLogout mutation hooks:**
+
+```typescript
+// hooks/queries/use-auth.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ApiError } from "@/lib/api-error";
+import { userKeys } from "./keys";
+
+export function useLogin() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (data: { email: string; password: string }) => {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const body = await res.json();
+        throw new ApiError(res.status, body.error);
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: userKeys.me() });
+    },
+  });
+}
+
+export function useLogout() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      await fetch("/api/auth/logout", { method: "POST" });
+    },
+    onSuccess: () => {
+      queryClient.clear();
+      window.location.replace("/login");
+    },
+  });
+}
+```
+
+### 1.12 테스트 설정 + 컴포넌트/훅 테스트
+
+#### 테스트 설정
+
+```typescript
+// src/tests/setup.ts
+import "@testing-library/jest-dom/vitest";
+```
+
+#### 컴포넌트 테스트 예시
+
+```typescript
+// src/components/features/auth/__tests__/login-form.test.tsx
+import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { renderWithProviders } from "@/tests/utils";
+import { LoginForm } from "../login-form";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+
+const server = setupServer();
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+describe("LoginForm", () => {
+  it("should display error message when login fails", async () => {
+    server.use(
+      http.post("/api/auth/login", () =>
+        HttpResponse.json(
+          { error: { code: "UNAUTHORIZED", message: "Invalid email or password", details: null } },
+          { status: 401 },
+        ),
+      ),
+    );
+    renderWithProviders(<LoginForm />);
+    // ... test interaction
+  });
+});
+```
+
+#### 훅 테스트 예시
+
+```typescript
+// src/hooks/queries/__tests__/use-current-user.test.ts
+import { renderHook, waitFor } from "@testing-library/react";
+import { createWrapper } from "@/tests/utils";
+import { useCurrentUser } from "../use-current-user";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+
+const server = setupServer();
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+describe("useCurrentUser", () => {
+  it("should fetch current user data", async () => {
+    server.use(
+      http.get("/api/v1/users/me", () =>
+        HttpResponse.json({ id: "1", email: "test@test.com", name: "Test" }),
+      ),
+    );
+    const { result } = renderHook(() => useCurrentUser(), { wrapper: createWrapper() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.email).toBe("test@test.com");
+  });
+});
+```
+
 ---
 
 ## 2. openapi-ts 연결
@@ -652,6 +984,11 @@ export default defineConfig({
 });
 ```
 
+> **경로 매핑:** openapi-ts는 Backend OpenAPI 스펙의 경로를 그대로 사용합니다 (예: `/api/v1/users`).
+> SDK 함수 호출 시 이 경로가 `baseUrl`과 결합됩니다. `baseUrl: ""`(빈 문자열)로 설정하여
+> SDK가 `/api/v1/users`로 요청하면, Next.js catch-all 라우트가 이를 캡처하여 Backend로 프록시합니다.
+> 자세한 경로 변환은 [§1.1 BFF 프록시](./SPECS-FRONTEND.md#11-bff-프록시)를 참조하세요.
+
 ### 2.2 API 클라이언트 설정
 
 ```typescript
@@ -660,7 +997,7 @@ import { createClient } from "@hey-api/client-fetch";
 import { ApiError } from "./api-error";
 
 export const apiClient = createClient({
-  baseUrl: "/api",   // BFF 프록시 경유 — Backend URL 직접 사용 금지
+  baseUrl: "",   // SDK가 생성하는 경로에 /api/v1/ prefix가 포함됨 → BFF catch-all이 처리
 });
 
 // 에러 응답 → ApiError 변환 인터셉터 (throwOnError 대신 사용)
@@ -685,6 +1022,7 @@ apiClient.interceptors.response.use((response) => {
 
 ```typescript
 // hooks/queries/use-users.ts
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getUsers, createUser } from "@/client/sdk.gen";
 import type { GetUsersData } from "@/client/types.gen";
 import { userKeys } from "./keys";
@@ -706,6 +1044,12 @@ export function useCreateUser() {
   });
 }
 ```
+
+**Auth 요청 규칙:**
+- 로그인, 회원가입, 토큰 갱신, 로그아웃은 **BFF 전용 라우트**(`/api/auth/*`)를 `fetch()`로 직접 호출합니다
+- openapi-ts SDK가 생성하는 auth 함수(`login()`, `refresh()` 등)는 **사용하지 않습니다**
+  - SDK의 auth 함수는 BFF를 우회하므로 쿠키가 설정되지 않습니다
+- openapi-ts SDK는 **인증된 일반 API 요청**(users, posts 등)에만 사용합니다
 
 ---
 
@@ -819,6 +1163,41 @@ async function onSubmit(data: UserCreate) {
         form.setError(field as keyof UserCreate, { message });
       });
     }
+  }
+}
+```
+
+### 3.4 에러 코드 → 사용자 메시지 매핑
+
+Backend 에러 코드를 한국어 사용자 메시지로 변환합니다. Backend의 `error.message`는 개발자용 영어 메시지이므로, Frontend에서 에러 코드 기반으로 사용자 친화적 메시지를 결정합니다.
+
+```typescript
+// src/lib/error-messages.ts
+const ERROR_MESSAGES: Record<string, string> = {
+  BAD_REQUEST: "잘못된 요청입니다.",
+  UNAUTHORIZED: "인증이 만료되었습니다. 다시 로그인해주세요.",
+  FORBIDDEN: "접근 권한이 없습니다.",
+  NOT_FOUND: "요청한 리소스를 찾을 수 없습니다.",
+  CONFLICT: "이미 존재하는 데이터입니다.",
+  VALIDATION_ERROR: "입력 데이터를 확인해주세요.",
+  RATE_LIMIT_EXCEEDED: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+  INTERNAL_ERROR: "서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+  BAD_GATEWAY: "서비스에 연결할 수 없습니다. 잠시 후 다시 시도해주세요.",
+};
+
+export function getErrorMessage(code: string, fallback?: string): string {
+  return ERROR_MESSAGES[code] ?? fallback ?? "오류가 발생했습니다.";
+}
+```
+
+**사용 예시 (mutation onError):**
+
+```typescript
+import { getErrorMessage } from "@/lib/error-messages";
+
+onError: (error) => {
+  if (error instanceof ApiError) {
+    toast.error(getErrorMessage(error.code, error.message));
   }
 }
 ```
