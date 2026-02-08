@@ -171,8 +171,95 @@ tests/
 | `POST /api/v1/auth/refresh` | 10/minute | silent refresh 동시 요청 고려 |
 
 **규칙:**
-- `slowapi.Limiter`를 `get_remote_address` key_func으로 초기화
+- `slowapi.Limiter`를 커스텀 `_get_client_ip` key_func으로 초기화 (프록시 환경의 `X-Forwarded-For` 처리)
 - 인증 엔드포인트에만 `@limiter.limit()` 데코레이터 적용
 - 429 응답도 프로젝트 통합 에러 포맷(`ErrorResponse`)을 따름
 - 운영 환경에서는 Redis 스토리지 백엔드 사용 (다중 인스턴스 대응)
 - 구현 코드는 [SPECS-BACKEND.md §1.7](./SPECS-BACKEND.md#17-rate-limiting) 참조
+
+---
+
+## 10. 로깅 전략
+
+**라이브러리:** `structlog` (구조화된 JSON 로깅)
+
+**로그 레벨:**
+
+| 레벨 | 용도 | 예시 |
+|------|------|------|
+| `DEBUG` | 개발 디버깅 | SQL 쿼리, 내부 상태 변화 |
+| `INFO` | 주요 이벤트 추적 | 로그인 성공, API 호출, 작업 완료 |
+| `WARNING` | 비정상이지만 복구 가능 | Replay 토큰 감지, Rate limit 도달 |
+| `ERROR` | 오류 발생 (복구 가능) | 외부 API 실패, DB 일시 오류 |
+| `CRITICAL` | 시스템 장애 | DB 연결 불가, 메모리 부족 |
+
+**구조화된 로깅 (structlog):**
+
+운영 환경에서는 JSON 포맷으로 로깅하여 로그 수집 시스템(ELK, CloudWatch)과 연동합니다.
+
+```python
+import structlog
+
+logger = structlog.get_logger()
+
+# 사용 예시
+logger.info("login_success", user_id=str(user.id))
+logger.warning("token_replay_detected", user_id=user_id_str, family_id=family_id)
+```
+
+**로그 포맷 예시:**
+
+```json
+{
+  "event": "login_success",
+  "level": "info",
+  "timestamp": "2024-01-15T10:30:45.123Z",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "request_id": "abc123",
+  "ip": "192.168.1.100"
+}
+```
+
+**주요 로깅 지점:**
+
+| 이벤트 | 레벨 | 필수 필드 |
+|--------|------|----------|
+| 로그인 성공 | INFO | `user_id` |
+| 로그인 실패 | INFO | `email`, `reason` (invalid_credentials/inactive_account) |
+| 토큰 갱신 | INFO | `user_id` |
+| Replay 토큰 의심 | WARNING | `token_prefix` (앞 8자) |
+| Replay 토큰 확정 | WARNING | `user_id`, `family_id` |
+| 전체 세션 무효화 | WARNING | `user_id` |
+| Rate limit 초과 | WARNING | `ip`, `endpoint` |
+| API 요청 | INFO | `method`, `path`, `status_code`, `duration` |
+| 예외 발생 | ERROR | `exception`, `traceback` |
+
+**로깅 규칙:**
+
+1. **컨텍스트 정보 포함**: `user_id`, `request_id`, `ip` 등 추적 가능한 식별자
+2. **민감 정보 제외**: 비밀번호, 토큰 전체 값(최대 앞 8자만), 이메일 마스킹
+3. **에러는 예외 스택 포함**: `logger.exception()` 사용
+4. **보안 이벤트는 WARNING 이상**: 로그인 실패, 토큰 재사용, 권한 없는 접근
+5. **운영: JSON (`LOG_JSON=true`)**, 개발: 콘솔 포맷 (`LOG_JSON=false`)
+
+**환경변수 설정:**
+
+```python
+# core/config.py (SPECS-BACKEND.md §1.2 참조)
+class Settings(BaseSettings):
+    LOG_LEVEL: str = "INFO"
+    LOG_JSON: bool = True  # 운영: True, 개발: False
+```
+
+**금지 사항:**
+
+| 항목 | 이유 |
+|------|------|
+| `print()` 사용 | 로그 레벨 제어 불가, 구조화 불가 |
+| 비밀번호/토큰 전체 값 로깅 | 보안 위험 (로그 파일 노출 시 인증 정보 탈취) |
+| PII (email, 전화번호) 평문 로깅 | GDPR/개인정보보호법 위반 가능 |
+| 과도한 DEBUG 로그 (운영) | 디스크 사용량 증가, 성능 저하 |
+
+**참조:**
+- AuthService 로깅 예시: [SPECS-BACKEND.md §2.2](./SPECS-BACKEND.md#22-authservice-참조-구현)
+- Settings 필드: [SPECS-BACKEND.md §1.2](./SPECS-BACKEND.md#12-settings)

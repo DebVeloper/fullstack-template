@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     ALLOWED_ORIGINS: list[str] = ["http://localhost:3000", "http://frontend:3000"]
+    LOG_LEVEL: str = "INFO"
+    LOG_JSON: bool = True
 
 settings = Settings()
 ```
@@ -217,7 +219,7 @@ from app.core.database import get_db
 from app.main import app
 from app.models.base import Base
 
-TEST_DATABASE_URL = settings.DATABASE_URL.replace("/app", "/test")
+TEST_DATABASE_URL = settings.DATABASE_URL.rsplit("/", 1)[0] + "/test"
 
 engine = create_async_engine(TEST_DATABASE_URL, echo=False)
 TestSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -280,9 +282,15 @@ async def authenticated_client(client: AsyncClient, db_session: AsyncSession):
 ```python
 # core/rate_limit.py
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
+def _get_client_ip(request) -> str:
+    """프록시 환경에서 실제 클라이언트 IP 추출."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+limiter = Limiter(key_func=_get_client_ip)
 ```
 
 ```python
@@ -363,13 +371,174 @@ async def get_user(db: AsyncSession, *, user_id: UUID) -> User:
 
 async def update_user(db: AsyncSession, *, user_id: UUID, obj_in: UserUpdate) -> User:
     user = await get_user(db, user_id=user_id)
-    return await user_repository.update(db, db_obj=user, obj_in=obj_in)
+    update_data = obj_in.model_dump(exclude_unset=True)
+    if "password" in update_data:
+        update_data["hashed_password"] = hash_password(update_data.pop("password"))
+    for field, value in update_data.items():
+        setattr(user, field, value)
+    await db.flush()
+    await db.refresh(user)
+    return user
 ```
 
 **핵심 원칙:**
 - Repository를 조합하여 비즈니스 로직 처리
 - 도메인 예외(`ConflictException`, `NotFoundException`)를 발생시켜 Router에 전달
 - 트랜잭션 관리는 `get_db()` 컨텍스트에 위임 (Service에서 commit/rollback 호출 금지)
+
+### 2.2 AuthService 참조 구현
+
+```python
+# services/auth_service.py
+import structlog
+from uuid import UUID, uuid4
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.exceptions import UnauthorizedException
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    verify_password,
+)
+from app.repositories.user_repository import user_repository
+from app.schemas.auth import LoginRequest, TokenResponse
+
+logger = structlog.get_logger()
+
+REFRESH_TOKEN_PREFIX = "refresh_token:"
+TOKEN_FAMILY_PREFIX = "token_family:"
+USER_FAMILIES_PREFIX = "user_families:"
+
+
+async def login(
+    db: AsyncSession, redis: Redis, *, body: LoginRequest
+) -> TokenResponse:
+    """이메일/비밀번호 인증 → 토큰 발급 + Redis 저장."""
+    user = await user_repository.get_by_email(db, email=body.email)
+    if user is None or not verify_password(body.password, user.hashed_password):
+        logger.info("login_failed", email=body.email, reason="invalid_credentials")
+        raise UnauthorizedException(message="Invalid email or password")
+    if not user.is_active:
+        logger.info("login_failed", email=body.email, reason="inactive_account")
+        raise UnauthorizedException(message="User account is inactive")
+
+    access_token = create_access_token(user.id)
+    refresh_token = create_refresh_token()
+    family_id = str(uuid4())
+    ttl = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+
+    pipe = redis.pipeline()
+    pipe.set(
+        f"{REFRESH_TOKEN_PREFIX}{refresh_token}",
+        f"{user.id}:{family_id}",
+        ex=ttl,
+    )
+    pipe.set(f"{TOKEN_FAMILY_PREFIX}{family_id}", refresh_token, ex=ttl)
+    pipe.sadd(f"{USER_FAMILIES_PREFIX}{user.id}", family_id)
+    await pipe.execute()
+
+    logger.info("login_success", user_id=str(user.id))
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+
+
+async def refresh(redis: Redis, *, refresh_token: str) -> TokenResponse:
+    """Refresh Token Rotation + Replay 감지."""
+    stored = await redis.get(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
+
+    if stored is None:
+        # 토큰이 없음 → 이미 rotation됨 → replay 공격 의심
+        # family_id를 알 수 없으므로 로그만 기록
+        logger.warning("token_replay_suspected", token_prefix=refresh_token[:8])
+        raise UnauthorizedException(message="Invalid or expired refresh token")
+
+    user_id_str, family_id = stored.rsplit(":", 1)
+
+    # Family의 현재 토큰과 일치하는지 확인
+    current_token = await redis.get(f"{TOKEN_FAMILY_PREFIX}{family_id}")
+    if current_token != refresh_token:
+        # 이미 rotation된 토큰이 재사용됨 → 탈취 감지!
+        logger.warning(
+            "token_replay_detected",
+            user_id=user_id_str,
+            family_id=family_id,
+        )
+        await _invalidate_all_sessions(redis, user_id_str)
+        raise UnauthorizedException(message="Token reuse detected. All sessions revoked.")
+
+    # Rotation: 기존 삭제 → 신규 발급
+    user_id = UUID(user_id_str)
+    new_access_token = create_access_token(user_id)
+    new_refresh_token = create_refresh_token()
+    ttl = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+
+    pipe = redis.pipeline()
+    pipe.delete(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
+    pipe.set(
+        f"{REFRESH_TOKEN_PREFIX}{new_refresh_token}",
+        f"{user_id_str}:{family_id}",
+        ex=ttl,
+    )
+    pipe.set(f"{TOKEN_FAMILY_PREFIX}{family_id}", new_refresh_token, ex=ttl)
+    await pipe.execute()
+
+    logger.info("token_refreshed", user_id=user_id_str)
+    return TokenResponse(access_token=new_access_token, refresh_token=new_refresh_token)
+
+
+async def logout(redis: Redis, *, refresh_token: str) -> None:
+    """Redis에서 Refresh Token + Family 삭제."""
+    stored = await redis.get(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
+    if stored:
+        user_id_str, family_id = stored.rsplit(":", 1)
+        pipe = redis.pipeline()
+        pipe.delete(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
+        pipe.delete(f"{TOKEN_FAMILY_PREFIX}{family_id}")
+        pipe.srem(f"{USER_FAMILIES_PREFIX}{user_id_str}", family_id)
+        await pipe.execute()
+        logger.info("logout_success", user_id=user_id_str)
+
+
+async def _invalidate_all_sessions(redis: Redis, user_id: str) -> None:
+    """탈취 감지 시 해당 사용자의 모든 세션 무효화."""
+    family_ids = await redis.smembers(f"{USER_FAMILIES_PREFIX}{user_id}")
+    if not family_ids:
+        return
+    pipe = redis.pipeline()
+    for family_id in family_ids:
+        current_token = await redis.get(f"{TOKEN_FAMILY_PREFIX}{family_id}")
+        if current_token:
+            pipe.delete(f"{REFRESH_TOKEN_PREFIX}{current_token}")
+        pipe.delete(f"{TOKEN_FAMILY_PREFIX}{family_id}")
+    pipe.delete(f"{USER_FAMILIES_PREFIX}{user_id}")
+    await pipe.execute()
+    logger.warning("all_sessions_invalidated", user_id=user_id)
+```
+
+**Refresh Token Rotation + Replay Detection:**
+- **Redis Key 구조:**
+  - `refresh_token:{token_value}` → value는 `{user_id}:{family_id}`
+  - `token_family:{family_id}` → value는 현재 유효한 token_value
+  - `user_families:{user_id}` → SET of family_id
+- **Replay 감지:** 이미 삭제된 토큰으로 refresh 시도 시 해당 사용자의 모든 세션 무효화
+- **TTL:** `REFRESH_TOKEN_EXPIRE_DAYS * 86400` 초
+
+### 2.3 Redis 의존성
+
+```python
+# core/redis.py
+from collections.abc import AsyncGenerator
+from redis.asyncio import Redis
+from app.core.config import settings
+
+async def get_redis() -> AsyncGenerator[Redis, None]:
+    redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        yield redis
+    finally:
+        await redis.aclose()
+```
 
 ---
 
@@ -513,9 +682,15 @@ async def get_current_user(
     token: str = Depends(oauth2_scheme),
 ) -> User:
     """JWT 검증 → User 조회 → is_active 확인"""
+    from uuid import UUID
     token_data = verify_access_token(token)
+    try:
+        user_id = UUID(token_data.sub)
+    except ValueError as e:
+        from app.core.exceptions import UnauthorizedException
+        raise UnauthorizedException(message="Invalid token payload") from e
     result = await db.execute(
-        select(User).where(User.id == token_data.sub)
+        select(User).where(User.id == user_id)
     )
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:

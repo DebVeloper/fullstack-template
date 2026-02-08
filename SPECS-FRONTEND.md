@@ -9,7 +9,7 @@
 
 ### 1.1 BFF 프록시
 
-BFF 프록시는 Backend에서 401 응답을 받으면 자동으로 토큰 갱신을 시도합니다 (Silent Refresh). 갱신 성공 시 새 쿠키를 설정하고 원래 요청을 재시도합니다. 갱신 실패 시 쿠키를 삭제하고 401을 클라이언트에 전달합니다.
+BFF 프록시는 Backend에서 401 응답을 받으면 자동으로 토큰 갱신을 시도합니다 (Silent Refresh). 갱신 성공 시 새 쿠키를 설정하고 원래 요청을 재시도합니다. 갱신 실패 시 쿠키를 삭제하고 401을 클라이언트에 전달합니다. 동시 다중 요청 시 refresh는 한 번만 실행됩니다 (Promise 캐싱).
 
 ```typescript
 // frontend/src/app/api/[...path]/route.ts
@@ -32,6 +32,46 @@ function filterHeaders(headers: Headers): Headers {
     }
   });
   return filtered;
+}
+
+// Silent Refresh 동시성 제어
+let refreshPromise: Promise<RefreshResult> | null = null;
+
+interface RefreshResult {
+  success: boolean;
+  accessToken?: string;
+  refreshToken?: string;
+}
+
+async function refreshTokens(currentRefreshToken: string): Promise<RefreshResult> {
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  refreshPromise = (async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: currentRefreshToken }),
+      });
+
+      if (!response.ok) {
+        return { success: false };
+      }
+
+      const tokens = await response.json();
+      return {
+        success: true,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+      };
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 async function proxyRequest(req: NextRequest) {
@@ -64,26 +104,17 @@ async function proxyRequest(req: NextRequest) {
     if (response.status === 401) {
       const refreshToken = cookieStore.get("refresh_token")?.value;
       if (refreshToken) {
-        const refreshResponse = await fetch(
-          `${BACKEND_URL}/api/v1/auth/refresh`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ refresh_token: refreshToken }),
-          },
-        );
+        const result = await refreshTokens(refreshToken);
 
-        if (refreshResponse.ok) {
-          const tokens = await refreshResponse.json();
-
-          cookieStore.set("access_token", tokens.access_token, {
+        if (result.success && result.accessToken && result.refreshToken) {
+          cookieStore.set("access_token", result.accessToken, {
             httpOnly: true,
             secure: IS_PRODUCTION,
             sameSite: "lax",
             path: "/",
             maxAge: 900,
           });
-          cookieStore.set("refresh_token", tokens.refresh_token, {
+          cookieStore.set("refresh_token", result.refreshToken, {
             httpOnly: true,
             secure: IS_PRODUCTION,
             sameSite: "lax",
@@ -92,7 +123,7 @@ async function proxyRequest(req: NextRequest) {
           });
 
           // 새 access_token으로 원래 요청 재시도
-          headers.set("Authorization", `Bearer ${tokens.access_token}`);
+          headers.set("Authorization", `Bearer ${result.accessToken}`);
           response = await fetch(url, {
             method: req.method,
             headers,
@@ -330,24 +361,31 @@ export function renderWithProviders(
 // frontend/src/middleware.ts
 import { NextRequest, NextResponse } from "next/server";
 
-const AUTH_ROUTES = ["/dashboard", "/settings"];
-const PUBLIC_ONLY_ROUTES = ["/login", "/register"];
+// 미인증 사용자도 접근 가능한 공개 라우트 (화이트리스트)
+const PUBLIC_ROUTES = ["/", "/login", "/register", "/about"];
+
+// 로그인 사용자가 접근하면 /dashboard로 리다이렉트할 라우트
+const AUTH_REDIRECT_ROUTES = ["/login", "/register"];
+
+function isPublicRoute(pathname: string): boolean {
+  return PUBLIC_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
 
 export function middleware(req: NextRequest) {
   const accessToken = req.cookies.get("access_token")?.value;
   const { pathname } = req.nextUrl;
 
-  // 인증 필요 라우트에 미인증 접근 → /login 리다이렉트
-  const isAuthRoute = AUTH_ROUTES.some((route) => pathname.startsWith(route));
-  if (isAuthRoute && !accessToken) {
+  // 공개 라우트가 아닌 모든 라우트는 인증 필요 (기본 보호)
+  if (!isPublicRoute(pathname) && !accessToken) {
     const loginUrl = new URL("/login", req.url);
-    loginUrl.searchParams.set("callbackUrl", pathname);
+    loginUrl.searchParams.set("callbackUrl", `${pathname}${req.nextUrl.search}`);
     return NextResponse.redirect(loginUrl);
   }
 
-  // 로그인된 사용자가 공개 전용 라우트 접근 → /dashboard 리다이렉트
-  const isPublicOnly = PUBLIC_ONLY_ROUTES.some((route) => pathname.startsWith(route));
-  if (isPublicOnly && accessToken) {
+  // 로그인된 사용자가 인증 전용 라우트 접근 → /dashboard 리다이렉트
+  if (accessToken && AUTH_REDIRECT_ROUTES.some((route) => pathname === route)) {
     return NextResponse.redirect(new URL("/dashboard", req.url));
   }
 
@@ -361,6 +399,77 @@ export const config = {
   ],
 };
 ```
+
+### 1.8 BFF 프록시 테스트
+
+BFF 프록시의 핵심 동작(인증 헤더 전달, Silent Refresh, 에러 전달)을 vitest로 테스트합니다. Backend는 MSW로 모킹합니다.
+
+```typescript
+// src/tests/bff-proxy.test.ts
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+
+const BACKEND_URL = "http://backend:8000";
+
+const server = setupServer();
+
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+describe("BFF Proxy", () => {
+  it("should forward authorization header from cookie", async () => {
+    let capturedAuth: string | null = null;
+    server.use(
+      http.get(`${BACKEND_URL}/api/v1/users/me`, ({ request }) => {
+        capturedAuth = request.headers.get("Authorization");
+        return HttpResponse.json({ id: "1", email: "test@test.com" });
+      }),
+    );
+
+    // Route Handler를 직접 import하여 테스트
+    // 실제 구현 시 NextRequest 모킹이 필요할 수 있음
+    expect(capturedAuth).toBe("Bearer test-token");
+  });
+
+  it("should attempt silent refresh on 401", async () => {
+    let refreshCalled = false;
+    server.use(
+      http.get(`${BACKEND_URL}/api/v1/users/me`, () => {
+        return HttpResponse.json({}, { status: 401 });
+      }),
+      http.post(`${BACKEND_URL}/api/v1/auth/refresh`, () => {
+        refreshCalled = true;
+        return HttpResponse.json({
+          access_token: "new-access",
+          refresh_token: "new-refresh",
+        });
+      }),
+    );
+
+    // ... 프록시 호출 후
+    expect(refreshCalled).toBe(true);
+  });
+
+  it("should return 502 when backend is unavailable", async () => {
+    server.use(
+      http.get(`${BACKEND_URL}/api/v1/users/me`, () => {
+        return HttpResponse.error();
+      }),
+    );
+
+    // ... 프록시 호출 후
+    // response.status === 502, body.error.code === "BAD_GATEWAY"
+  });
+});
+```
+
+**테스트 전략:**
+- MSW로 Backend 응답 모킹 (네트워크 레벨 인터셉트)
+- Next.js Route Handler는 순수 함수로 import하여 테스트
+- `NextRequest`/`NextResponse` 모킹: `next/server`에서 직접 생성 가능
+- 쿠키 검증: 응답의 `Set-Cookie` 헤더 확인
 
 ---
 
@@ -397,16 +506,21 @@ import { ApiError } from "./api-error";
 
 export const apiClient = createClient({
   baseUrl: "/api",   // BFF 프록시 경유 — Backend URL 직접 사용 금지
-  throwOnError: true, // 4xx/5xx 응답 시 에러 throw
 });
 
-// SDK 에러 → ApiError 변환 인터셉터
+// 에러 응답 → ApiError 변환 인터셉터 (throwOnError 대신 사용)
 apiClient.interceptors.response.use((response) => {
   if (response.status >= 400) {
     const body = response.data as { error?: { code: string; message: string; details: unknown } };
     if (body?.error) {
       throw new ApiError(response.status, body.error);
     }
+    // Backend 에러 포맷이 아닌 경우 (예: BFF 502, nginx 에러)
+    throw new ApiError(response.status, {
+      code: "UNKNOWN_ERROR",
+      message: `Request failed with status ${response.status}`,
+      details: null,
+    });
   }
   return response;
 });
@@ -505,7 +619,10 @@ export function createQueryClient() {
         onError: (error) => {
           if (error instanceof ApiError) {
             if (error.status === 401) {
-              window.location.href = "/login";
+              // SSR 환경 guard + SPA 친화적 리다이렉트
+              if (typeof window !== "undefined") {
+                window.location.replace("/login");
+              }
               return;
             }
             toast.error(error.message);

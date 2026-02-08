@@ -77,6 +77,7 @@ docker compose exec backend alembic upgrade head
 | | Playwright | latest | Frontend E2E 테스트 |
 | **배포** | Docker Compose | latest | 올인원 구성 |
 | **CI/CD** | GitHub Actions | - | 자동화 파이프라인 |
+| **로깅** | structlog | latest | 구조화 JSON 로깅 (stdlib 통합) |
 | **Git Hooks** | pre-commit | latest | 커밋 전 lint/format 자동 실행 |
 
 ---
@@ -124,6 +125,7 @@ fullstack-template/
 │   │   │   ├── config.py        # 환경변수 설정
 │   │   │   ├── security.py      # JWT, 비밀번호 해싱
 │   │   │   ├── database.py      # DB 엔진 & 세션
+│   │   │   ├── redis.py         # Redis 연결 & 세션
 │   │   │   ├── exceptions.py    # 커스텀 예외 계층
 │   │   │   └── rate_limit.py    # Rate Limiting (slowapi)
 │   │   ├── models/              # SQLAlchemy 모델
@@ -211,6 +213,33 @@ fullstack-template/
 | Refresh Token | UUID v4 | 7일 | Redis + httpOnly 쿠키 |
 
 **Refresh Token Rotation:** 갱신 시 기존 refresh token을 폐기하고 새 토큰 발급 (탈취 방어).
+
+**Refresh Token Replay 감지:**
+
+Token Family 패턴으로 토큰 탈취를 조기 감지합니다.
+
+**Token Family 전략:**
+- 각 로그인 세션마다 고유 `family_id` 할당 (UUID v4)
+- Redis에 family별 현재 유효 토큰 추적
+- Rotation 시 family는 유지하고 토큰만 교체
+
+**Redis Key 구조:**
+
+| Key 패턴 | Value | TTL | 용도 |
+|----------|-------|-----|------|
+| `refresh_token:{token}` | `{user_id}:{family_id}` | 7일 | 토큰 → 사용자/패밀리 매핑 |
+| `token_family:{family_id}` | 현재 유효한 token | 7일 | 패밀리별 최신 토큰 추적 |
+| `user_families:{user_id}` | SET of family_id | 무제한 | 사용자의 모든 세션 추적 |
+
+**Replay 감지 시나리오:**
+
+| 상황 | 판단 | Backend 동작 |
+|------|------|-------------|
+| 토큰이 Redis에 없음 | 이미 rotation됨 또는 만료 | 로그 기록, 401 반환 |
+| 토큰은 있지만 family의 현재 토큰과 불일치 | **탈취 확정** — 정상 사용자는 새 토큰을 받았는데 구 토큰이 재사용됨 | 해당 사용자의 **모든 세션 무효화** (user_families의 모든 family 삭제) → 401 + "Token reuse detected. All sessions revoked." |
+| 토큰과 family 토큰이 일치 | 정상 요청 | Rotation 수행 (기존 삭제 → 신규 발급) |
+
+**참조 구현:** [SPECS-BACKEND.md §2.2](./SPECS-BACKEND.md#22-authservice-참조-구현)
 
 **쿠키 전략 — BFF 주도 설정:**
 
@@ -449,6 +478,8 @@ PostgreSQL / Redis               ← 데이터 저장소
 | `SECRET_KEY` | backend | JWT 서명 키 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | backend | Access Token 만료 (기본: 15) |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | backend | Refresh Token 만료 (기본: 7) |
+| `LOG_LEVEL` | backend | 로그 레벨 (기본: INFO) |
+| `LOG_JSON` | backend | JSON 포맷 출력 (기본: true) |
 | `BACKEND_URL` | frontend | Backend 내부 URL |
 | `NEXT_PUBLIC_APP_NAME` | frontend | 앱 이름 (클라이언트 노출) |
 
