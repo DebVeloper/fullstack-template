@@ -7,7 +7,7 @@
 ### 사용법
 
 ```bash
-git clone https://github.com/DebVeloper/fullstack-template.git my-project
+git clone https://github.com/debveloper/fullstack-template.git my-project
 cd my-project
 # 프로젝트명에 맞게 설정 변경 후 개발 시작
 ```
@@ -16,9 +16,12 @@ cd my-project
 
 | 문서 | 설명 |
 |------|------|
-| [CONVENTIONS.md](./CONVENTIONS.md) | 코딩 컨벤션, API 규격, 테스팅 규격 |
-| [AGENTS.md](./AGENTS.md) | AI 에이전트 작업 규칙 |
-| [CLAUDE.md](./CLAUDE.md) | Claude Code 프로젝트 설정 |
+| [CONVENTIONS.md](./CONVENTIONS.md) | 공통 컨벤션 (네이밍, Git, API 규격, 테스팅 원칙) |
+| [CONVENTIONS-FRONTEND.md](./CONVENTIONS-FRONTEND.md) | Frontend 규격 (App Router, TanStack Query, Tailwind) |
+| [CONVENTIONS-BACKEND.md](./CONVENTIONS-BACKEND.md) | Backend 규격 (3-Layer, Pydantic, JWT, DB) |
+| [SPECS-BACKEND.md](./SPECS-BACKEND.md) | Backend 참조 구현 코드 (보일러플레이트) |
+| [SPECS-FRONTEND.md](./SPECS-FRONTEND.md) | Frontend 참조 구현 코드 (보일러플레이트) |
+| [CLAUDE.md](./CLAUDE.md) | Claude Code 프로젝트 설정 및 AI 에이전트 규칙 |
 
 ---
 
@@ -32,6 +35,7 @@ cd my-project
 | | TanStack Query | v5 | 서버 상태 관리 |
 | | Tailwind CSS | v4 | 유틸리티 퍼스트 |
 | | shadcn/ui | latest | 컴포넌트 라이브러리 |
+| | openapi-ts | latest | API 클라이언트/타입 자동 생성 |
 | **Backend** | FastAPI | 0.115+ | async 기반 |
 | | Pydantic | v2 | 데이터 검증 |
 | | SQLAlchemy | 2.0+ (async) | ORM |
@@ -39,10 +43,12 @@ cd my-project
 | | Redis | 7+ | redis-py async |
 | **인증** | JWT | 커스텀 | access + refresh token |
 | **마이그레이션** | Alembic | latest | autogenerate |
-| **테스트** | pytest | latest | Backend TDD |
-| | vitest | latest | Frontend TDD |
+| **테스트** | pytest | latest | Backend TDD (pytest-asyncio) |
+| | vitest | latest | Frontend 단위/통합 테스트 (RTL, MSW) |
+| | Playwright | latest | Frontend E2E 테스트 |
 | **배포** | Docker Compose | latest | 올인원 구성 |
 | **CI/CD** | GitHub Actions | - | 자동화 파이프라인 |
+| **Git Hooks** | pre-commit | latest | 커밋 전 lint/format 자동 실행 |
 
 ---
 
@@ -65,12 +71,15 @@ fullstack-template/
 │   │   ├── hooks/
 │   │   │   └── queries/         # TanStack Query 커스텀 훅
 │   │   ├── lib/                 # 유틸리티, API 클라이언트
+│   │   ├── client/              # openapi-ts 자동 생성 (수동 수정 금지)
 │   │   └── types/               # TypeScript 타입 정의
+│   ├── e2e/                     # Playwright E2E 테스트
 │   ├── public/                  # 정적 파일
 │   ├── next.config.ts
-│   ├── tailwind.config.ts
 │   ├── tsconfig.json
 │   ├── vitest.config.ts
+│   ├── playwright.config.ts
+│   ├── openapi-ts.config.ts
 │   └── package.json
 ├── backend/                     # FastAPI 애플리케이션
 │   ├── app/
@@ -125,9 +134,14 @@ fullstack-template/
 ├── docker-compose.yml           # 개발 환경
 ├── docker-compose.prod.yml      # 운영 환경
 ├── .env.example                 # 환경변수 템플릿
+├── .pre-commit-config.yaml      # pre-commit 설정
 ├── ARCHITECTURE.md              # 아키텍처 문서 (본 문서)
-├── CONVENTIONS.md               # 코딩 컨벤션
-└── AGENTS.md                    # AI 에이전트 규칙
+├── CONVENTIONS.md               # 공통 컨벤션
+├── CONVENTIONS-FRONTEND.md      # Frontend 규격
+├── CONVENTIONS-BACKEND.md       # Backend 규격
+├── SPECS-BACKEND.md             # Backend 참조 구현 코드
+├── SPECS-FRONTEND.md            # Frontend 참조 구현 코드
+└── CLAUDE.md                    # Claude Code 설정 및 AI 에이전트 규칙
 ```
 
 ---
@@ -152,47 +166,9 @@ fullstack-template/
 - 요청/응답 변환 가능 (BFF 역할)
 - CORS 이슈 회피
 
-**Next.js API Route 프록시 예시:**
+**핵심 동작:** 쿠키에서 access_token 추출 → Authorization 헤더 첨부 → Backend로 프록시.
 
-```typescript
-// frontend/src/app/api/[...path]/route.ts
-import { cookies } from "next/headers";
-import { NextRequest, NextResponse } from "next/server";
-
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
-
-async function proxyRequest(req: NextRequest) {
-  const path = req.nextUrl.pathname.replace(/^\/api/, "");
-  const url = `${BACKEND_URL}/api/v1${path}${req.nextUrl.search}`;
-
-  const cookieStore = await cookies();
-  const accessToken = cookieStore.get("access_token")?.value;
-
-  const headers = new Headers(req.headers);
-  headers.delete("host");
-  if (accessToken) {
-    headers.set("Authorization", `Bearer ${accessToken}`);
-  }
-
-  const response = await fetch(url, {
-    method: req.method,
-    headers,
-    body: req.method !== "GET" && req.method !== "HEAD"
-      ? await req.text()
-      : undefined,
-  });
-
-  return new NextResponse(response.body, {
-    status: response.status,
-    headers: response.headers,
-  });
-}
-
-export const GET = proxyRequest;
-export const POST = proxyRequest;
-export const PATCH = proxyRequest;
-export const DELETE = proxyRequest;
-```
+프록시 구현 코드는 [SPECS-FRONTEND.md §1.1](./SPECS-FRONTEND.md#11-bff-프록시)을 참조하세요.
 
 ### 4.2 JWT 인증 흐름
 
@@ -248,7 +224,7 @@ export const DELETE = proxyRequest;
 
 ### 4.3 에러 핸들링
 
-통합 에러 응답 포맷을 사용합니다. 상세 스키마는 [CONVENTIONS.md §3.4](./CONVENTIONS.md#34-에러-응답-포맷)를 참조하세요.
+통합 에러 응답 포맷을 사용합니다. 상세 스키마는 [SPECS-BACKEND.md §1.5](./SPECS-BACKEND.md#15-error-schemas--exception-hierarchy)를 참조하세요.
 
 **응답 포맷:**
 
@@ -276,22 +252,9 @@ AppException (base)
 
 ### 4.4 DB 마이그레이션
 
-Alembic을 사용하여 데이터베이스 스키마를 관리합니다. 모델 규칙은 [CONVENTIONS.md §3.5](./CONVENTIONS.md#35-db-모델--마이그레이션)를 참조하세요.
+Alembic을 사용하여 데이터베이스 스키마를 관리합니다. 모델 규칙은 [CONVENTIONS-BACKEND.md §6](./CONVENTIONS-BACKEND.md#6-db-모델--마이그레이션)를 참조하세요.
 
-**공통 필드 (TimestampMixin):**
-
-```python
-class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-```
+**PK 전략:** 모든 테이블은 UUID v4를 Primary Key로 사용합니다 (`uuid.uuid4` default).
 
 **마이그레이션 워크플로우:**
 
@@ -353,97 +316,38 @@ PostgreSQL / Redis               ← 데이터 저장소
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**Redis 접근 원칙:**
+- Refresh Token 관리 등 캐시/세션 작업은 Service 계층에서 Redis에 직접 접근
+- Redis 접근 로직이 복잡해지면 별도 Repository로 분리
+
 ---
 
 ## 6. 개발 환경
 
 ### docker-compose.yml
 
-```yaml
-services:
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: ../docker/frontend/Dockerfile
-      target: development
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend/src:/app/src
-    environment:
-      - BACKEND_URL=http://backend:8000
-    depends_on:
-      - backend
+| 서비스 | 이미지/빌드 | 포트 | 핵심 설정 |
+|--------|------------|------|-----------|
+| frontend | `docker/frontend/Dockerfile` (dev) | 3000 | 소스 마운트 (`./frontend/src:/app/src`) |
+| backend | `docker/backend/Dockerfile` (dev) | 8000 | uvicorn `--reload`, DB/Redis 의존 |
+| db | `postgres:16-alpine` | 5432 | healthcheck, volume 영속화 |
+| redis | `redis:7-alpine` | 6379 | healthcheck, volume 영속화 |
 
-  backend:
-    build:
-      context: ./backend
-      dockerfile: ../docker/backend/Dockerfile
-      target: development
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend/app:/app/app
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/app
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=dev-secret-key-change-in-production
-      - ACCESS_TOKEN_EXPIRE_MINUTES=15
-      - REFRESH_TOKEN_EXPIRE_DAYS=7
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+설정 파일: `docker-compose.yml`
 
-  db:
-    image: postgres:16-alpine
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=app
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+### 환경변수
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+| 변수 | 서비스 | 설명 |
+|------|--------|------|
+| `DATABASE_URL` | backend | PostgreSQL 연결 (asyncpg) |
+| `REDIS_URL` | backend | Redis 연결 |
+| `SECRET_KEY` | backend | JWT 서명 키 |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | backend | Access Token 만료 (기본: 15) |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | backend | Refresh Token 만료 (기본: 7) |
+| `BACKEND_URL` | frontend | Backend 내부 URL |
+| `NEXT_PUBLIC_APP_NAME` | frontend | 앱 이름 (클라이언트 노출) |
 
-volumes:
-  postgres_data:
-  redis_data:
-```
-
-### .env.example
-
-```bash
-# Backend
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/app
-REDIS_URL=redis://redis:6379/0
-SECRET_KEY=your-secret-key-here
-ACCESS_TOKEN_EXPIRE_MINUTES=15
-REFRESH_TOKEN_EXPIRE_DAYS=7
-
-# Frontend
-BACKEND_URL=http://backend:8000
-NEXT_PUBLIC_APP_NAME=MyApp
-```
+설정 파일: `.env.example`
 
 ### Hot Reload
 
@@ -456,150 +360,34 @@ NEXT_PUBLIC_APP_NAME=MyApp
 
 ## 7. 배포
 
-### Multi-stage Dockerfile 전략
+### Multi-stage Dockerfile
 
-```dockerfile
-# docker/backend/Dockerfile
-FROM python:3.12-slim AS base
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+| 서비스 | Base | Development | Production |
+|--------|------|-------------|------------|
+| Backend | `python:3.12-slim` + requirements | uvicorn `--reload` | uvicorn `--workers 4` |
+| Frontend | `node:20-alpine` + npm ci | `npm run dev` | `output: "standalone"` + `node server.js` |
 
-FROM base AS development
-COPY . .
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+설정 파일: `docker/backend/Dockerfile`, `docker/frontend/Dockerfile`
 
-FROM base AS production
-COPY . .
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
-```
+### 운영 환경 (docker-compose.prod.yml)
 
-```dockerfile
-# docker/frontend/Dockerfile
-FROM node:20-alpine AS base
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+개발 환경과의 주요 차이:
+- `target: production` (Multi-stage 빌드)
+- 소스 마운트 없음 (이미지에 코드 포함)
+- 환경변수를 외부에서 주입 (`${DATABASE_URL}` 등)
+- 디버그 포트 미노출
 
-FROM base AS development
-COPY . .
-CMD ["npm", "run", "dev"]
-
-FROM base AS builder
-COPY . .
-RUN npm run build
-
-FROM node:20-alpine AS production
-WORKDIR /app
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
-COPY --from=builder /app/public ./public
-CMD ["node", "server.js"]
-```
-
-### docker-compose.prod.yml 개요
-
-```yaml
-services:
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: ../docker/frontend/Dockerfile
-      target: production
-    ports:
-      - "3000:3000"
-    environment:
-      - BACKEND_URL=http://backend:8000
-
-  backend:
-    build:
-      context: ./backend
-      dockerfile: ../docker/backend/Dockerfile
-      target: production
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=${REDIS_URL}
-      - SECRET_KEY=${SECRET_KEY}
-
-  db:
-    image: postgres:16-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-
-volumes:
-  postgres_data:
-  redis_data:
-```
+설정 파일: `docker-compose.prod.yml`
 
 ### GitHub Actions CI/CD
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
+**트리거**: `pull_request` → `main`, `develop` 브랜치
 
-on:
-  pull_request:
-    branches: [main, develop]
+| Job | 환경 | 실행 항목 |
+|-----|------|-----------|
+| `frontend` | Node 20 | lint → type-check → test (coverage) |
+| `backend` | Python 3.12 + PostgreSQL + Redis | ruff → mypy → pytest (coverage) |
+| `e2e` | Docker Compose + Playwright | frontend/backend 통과 후 실행 |
 
-jobs:
-  frontend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run type-check
-      - run: npm run test -- --coverage
+설정 파일: `.github/workflows/ci.yml`
 
-  backend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: ruff check .
-      - run: mypy .
-      - run: pytest --cov --cov-report=xml
-```
