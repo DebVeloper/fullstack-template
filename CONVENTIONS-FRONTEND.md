@@ -24,8 +24,15 @@ src/app/
 │   └── register/
 │       └── page.tsx
 ├── api/                         # BFF API Routes
+│   ├── auth/                    # 인증 전용 BFF 라우트
+│   │   ├── login/
+│   │   │   └── route.ts         # 로그인 → 쿠키 설정
+│   │   ├── refresh/
+│   │   │   └── route.ts         # 토큰 갱신 → 쿠키 교체
+│   │   └── logout/
+│   │       └── route.ts         # 로그아웃 → 쿠키 삭제
 │   └── [...path]/
-│       └── route.ts
+│       └── route.ts             # 범용 프록시
 ├── layout.tsx                   # 루트 레이아웃 (Providers)
 ├── page.tsx                     # 홈페이지
 ├── loading.tsx                  # 글로벌 로딩
@@ -96,9 +103,9 @@ export function LoginForm({ onSuccess }: LoginFormProps) {
 
 ## 3. TanStack Query 패턴
 
-**Query Key Factory** — 구현 코드는 [SPECS-FRONTEND.md §1.2](./SPECS-FRONTEND.md#12-query-key-factory)를 참조하세요.
+**Query Key Factory** — 구현 코드는 [SPECS-FRONTEND.md §1.3](./SPECS-FRONTEND.md#13-query-key-factory)를 참조하세요.
 
-**Custom Hook 캡슐화** — 구현 코드는 [SPECS-FRONTEND.md §1.3](./SPECS-FRONTEND.md#13-custom-hook-패턴)을 참조하세요.
+**Custom Hook 캡슐화** — 구현 코드는 [SPECS-FRONTEND.md §1.4](./SPECS-FRONTEND.md#14-custom-hook-패턴)을 참조하세요.
 
 **규칙:**
 - 컴포넌트에서 `useQuery`/`useMutation` 직접 호출 금지 → 반드시 커스텀 훅으로 캡슐화
@@ -111,7 +118,7 @@ export function LoginForm({ onSuccess }: LoginFormProps) {
 
 shadcn/ui 테마는 Tailwind v4 CSS-first 방식으로 `globals.css`에서 OKLCH CSS 변수로 정의합니다.
 
-**cn() 유틸리티** — `lib/utils.ts`의 `cn()` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.4](./SPECS-FRONTEND.md#14-cn-유틸리티)를 참조하세요.
+**cn() 유틸리티** — `lib/utils.ts`의 `cn()` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.5](./SPECS-FRONTEND.md#15-cn-유틸리티)를 참조하세요.
 
 **규칙:**
 - Tailwind v4는 CSS-first 설정 — `tailwind.config.ts` 불필요 (`globals.css`의 `@theme`/`@custom-variant` 사용)
@@ -127,6 +134,7 @@ shadcn/ui 테마는 Tailwind v4 CSS-first 방식으로 `globals.css`에서 OKLCH
 - `loading.tsx`: Skeleton UI로 구성 (`@/components/ui/skeleton`)
 - `error.tsx`: `'use client'` 필수, `error`와 `reset` props로 에러 표시 + 재시도
 - Toast: Sonner 라이브러리 사용 (`toast.success()`, `toast.error()`)
+- API 에러 처리: [SPECS-FRONTEND.md §3](./SPECS-FRONTEND.md#3-에러-처리)를 참조하세요.
 
 ---
 
@@ -151,7 +159,7 @@ Backend의 OpenAPI 스펙에서 타입과 API 클라이언트를 자동 생성�
 
 **설정:** `vitest.config.ts`에서 `environment: "jsdom"`, `setupFiles: ["./src/tests/setup.ts"]` 설정.
 
-**Wrapper fixture** — `src/tests/utils.tsx`의 `renderWithProviders` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.5](./SPECS-FRONTEND.md#15-테스트-wrapper)를 참조하세요.
+**Wrapper fixture** — `src/tests/utils.tsx`의 `renderWithProviders` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.6](./SPECS-FRONTEND.md#16-테스트-wrapper)를 참조하세요.
 
 **규칙:**
 - 사용자 행동 기반 테스트 (`getByRole`, `getByLabelText`) — `getByTestId` 최후 수단

@@ -181,6 +181,19 @@ fullstack-template/
 
 **Refresh Token Rotation:** 갱신 시 기존 refresh token을 폐기하고 새 토큰 발급 (탈취 방어).
 
+**쿠키 전략 — BFF 주도 설정:**
+
+Backend는 JSON body로 토큰을 반환하고, BFF(Next.js API Route)가 쿠키를 설정합니다. Backend auth 엔드포인트는 `Set-Cookie` 헤더를 사용하지 않습니다.
+
+| 쿠키 | 값 | httpOnly | secure | sameSite | path | maxAge |
+|------|-----|----------|--------|----------|------|--------|
+| `access_token` | JWT 문자열 | true | true (prod) | lax | `/` | 15분 (900초) |
+| `refresh_token` | UUID v4 | true | true (prod) | lax | `/api/auth` | 7일 (604800초) |
+
+- **Backend 응답**: `TokenResponse { access_token, refresh_token, token_type }` (JSON body)
+- **BFF 역할**: Backend 응답 수신 → `Set-Cookie` 헤더로 httpOnly 쿠키 설정 → 클라이언트에 전달
+- **Logout**: BFF가 쿠키 삭제 (`maxAge=0`) + Backend에 refresh_token body 전송 → Redis 삭제
+
 **인증 플로우:**
 
 ```
@@ -205,14 +218,16 @@ fullstack-template/
 
 3. 토큰 갱신
    Client ──POST /api/auth/refresh──▶ BFF ──▶ FastAPI
-                                               │
-                                               ├─ Refresh Token 쿠키 추출
-                                               ├─ Redis에서 유효성 확인
-                                               ├─ 기존 Refresh Token 삭제 (Rotation)
-                                               ├─ 새 Access + Refresh Token 생성
-                                               ├─ Redis에 새 Refresh Token 저장
-                                               │
+                                       │        │
+                                       │        ├─ Body에서 refresh_token 추출
+                                       │        ├─ Redis에서 유효성 확인
+                                       │        ├─ 기존 Refresh Token 삭제 (Rotation)
+                                       │        ├─ 새 Access + Refresh Token 생성
+                                       │        ├─ Redis에 새 Refresh Token 저장
+                                       │        │
    Client ◀── Set-Cookie(httpOnly) ◀── BFF ◀──┘
+                                       │
+                                       └─ 쿠키에서 refresh_token 추출 → Body로 Backend에 전달
 
 4. 로그아웃
    Client ──POST /api/auth/logout──▶ BFF ──▶ FastAPI
@@ -234,6 +249,21 @@ fullstack-template/
     "code": "NOT_FOUND",
     "message": "User not found",
     "details": null
+  }
+}
+```
+
+**422 Validation Error 응답:**
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed",
+    "details": [
+      { "field": "email", "message": "value is not a valid email address" },
+      { "field": "password", "message": "String should have at least 8 characters" }
+    ]
   }
 }
 ```

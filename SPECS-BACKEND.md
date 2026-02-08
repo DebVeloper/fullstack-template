@@ -98,6 +98,85 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 ```
 
+#### AppException 구현
+
+```python
+# core/exceptions.py
+class AppException(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: list | dict | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.details = details
+
+class BadRequestException(AppException):
+    def __init__(self, message: str = "Bad request", details=None):
+        super().__init__(400, "BAD_REQUEST", message, details)
+
+class UnauthorizedException(AppException):
+    def __init__(self, message: str = "Unauthorized", details=None):
+        super().__init__(401, "UNAUTHORIZED", message, details)
+
+class ForbiddenException(AppException):
+    def __init__(self, message: str = "Forbidden", details=None):
+        super().__init__(403, "FORBIDDEN", message, details)
+
+class NotFoundException(AppException):
+    def __init__(self, message: str = "Not found", details=None):
+        super().__init__(404, "NOT_FOUND", message, details)
+
+class ConflictException(AppException):
+    def __init__(self, message: str = "Conflict", details=None):
+        super().__init__(409, "CONFLICT", message, details)
+
+class InternalServerException(AppException):
+    def __init__(self, message: str = "Internal server error", details=None):
+        super().__init__(500, "INTERNAL_ERROR", message, details)
+```
+
+#### Exception Handlers (main.py)
+
+```python
+# main.py exception handlers
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(AppException)
+async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    details = [
+        {"field": ".".join(str(loc) for loc in e["loc"][1:]), "message": e["msg"]}
+        for e in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "VALIDATION_ERROR", "message": "Request validation failed", "details": details}},
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # 로깅 (스택트레이스는 서버 로그에만, 클라이언트에는 노출 금지)
+    import logging
+    logging.exception("Unhandled exception")
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"code": "INTERNAL_ERROR", "message": "Internal server error", "details": None}},
+    )
+```
+
 예외 계층 및 에러 JSON 포맷은 [ARCHITECTURE.md §4.3](./ARCHITECTURE.md#43-에러-핸들링)을 참조하세요.
 
 ### 1.6 conftest.py Fixture
@@ -162,7 +241,60 @@ async def authenticated_client(client: AsyncClient):
 
 ## 2. Auth
 
-### 2.1 Security 함수 시그니처
+### 2.1 Auth 스키마
+
+```python
+# schemas/auth.py
+from pydantic import BaseModel, EmailStr
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+```
+
+### 2.2 Auth 엔드포인트
+
+```python
+# api/v1/endpoints/auth.py
+from fastapi import APIRouter, Depends, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+@router.post("/login", response_model=TokenResponse)
+async def login(
+    body: LoginRequest,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    """이메일/비밀번호 인증 → access_token + refresh_token JSON 반환.
+    BFF가 쿠키를 설정한다 (Backend는 Set-Cookie 사용 안 함)."""
+    ...
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh(
+    body: RefreshRequest,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    """refresh_token을 body로 수신 → 검증 → Rotation(기존 삭제 + 신규 발급)."""
+    ...
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(
+    body: RefreshRequest,
+) -> None:
+    """refresh_token을 body로 수신 → Redis에서 삭제 → 204 No Content."""
+    ...
+```
+
+### 2.3 Security 함수 시그니처
 
 ```python
 # core/security.py
@@ -173,7 +305,7 @@ def verify_password(plain: str, hashed: str) -> bool: ...  # bcrypt (passlib)
 def hash_password(password: str) -> str: ...           # bcrypt (passlib)
 ```
 
-### 2.2 인증 의존성
+### 2.4 인증 의존성
 
 ```python
 # api/dependencies.py
