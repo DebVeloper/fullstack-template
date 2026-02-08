@@ -197,6 +197,8 @@ tests/
 
 운영 환경에서는 JSON 포맷으로 로깅하여 로그 수집 시스템(ELK, CloudWatch)과 연동합니다.
 
+초기 설정 코드는 [SPECS-BACKEND.md §1.8](./SPECS-BACKEND.md#18-로깅-설정)을 참조하세요.
+
 ```python
 import structlog
 

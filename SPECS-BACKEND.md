@@ -112,6 +112,24 @@ class TimestampMixin:
     )
 ```
 
+```python
+# models/user.py
+import uuid
+from sqlalchemy import String, Boolean
+from sqlalchemy.orm import Mapped, mapped_column
+from app.models.base import Base, TimestampMixin
+
+
+class User(Base, TimestampMixin):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+```
+
 ### 1.5 Error Schemas + Exception Hierarchy
 
 ```python
@@ -196,8 +214,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     # 로깅 (스택트레이스는 서버 로그에만, 클라이언트에는 노출 금지)
-    import logging
-    logging.exception("Unhandled exception")
+    import structlog
+    logger = structlog.get_logger()
+    logger.exception("unhandled_exception", exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={"error": {"code": "INTERNAL_ERROR", "message": "Internal server error", "details": None}},
@@ -329,6 +348,129 @@ async def login(...): ...
 @router.post("/refresh", response_model=TokenResponse)
 @limiter.limit("10/minute")
 async def refresh(...): ...
+```
+
+### 1.8 로깅 설정
+
+```python
+# core/logging.py
+import logging
+import structlog
+from app.core.config import settings
+
+
+def configure_logging() -> None:
+    """structlog 초기 설정. main.py에서 앱 시작 시 호출."""
+    shared_processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+
+    if settings.LOG_JSON:
+        renderer = structlog.processors.JSONRenderer()
+    else:
+        renderer = structlog.dev.ConsoleRenderer()
+
+    structlog.configure(
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    formatter = structlog.stdlib.ProcessorFormatter(
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            renderer,
+        ],
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(settings.LOG_LEVEL.upper())
+```
+
+```python
+# core/middleware.py
+import uuid
+import structlog
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """요청마다 고유 request_id를 생성하고 structlog 컨텍스트에 바인딩."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+```
+
+```python
+# main.py에 추가 (app 생성 직후)
+from app.core.logging import configure_logging
+from app.core.middleware import RequestIdMiddleware
+
+configure_logging()
+app.add_middleware(RequestIdMiddleware)
+```
+
+### 1.9 Health Check
+
+```python
+# api/v1/endpoints/health.py
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from redis.asyncio import Redis
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.redis import get_redis
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/health")
+async def health_check(
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+) -> JSONResponse:
+    """Liveness + Readiness probe. DB와 Redis 연결 상태 확인."""
+    db_ok = False
+    redis_ok = False
+    try:
+        await db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+    try:
+        await redis.ping()
+        redis_ok = True
+    except Exception:
+        pass
+
+    status = "healthy" if (db_ok and redis_ok) else "unhealthy"
+    return JSONResponse(
+        status_code=200 if status == "healthy" else 503,
+        content={"status": status, "db": db_ok, "redis": redis_ok},
+    )
 ```
 
 ---
@@ -500,20 +642,26 @@ async def logout(redis: Redis, *, refresh_token: str) -> None:
         logger.info("logout_success", user_id=user_id_str)
 
 
+_INVALIDATE_ALL_SESSIONS_SCRIPT = """
+local family_ids = redis.call('SMEMBERS', KEYS[1])
+for _, fid in ipairs(family_ids) do
+    local token = redis.call('GET', 'token_family:' .. fid)
+    if token then
+        redis.call('DEL', 'refresh_token:' .. token)
+    end
+    redis.call('DEL', 'token_family:' .. fid)
+end
+redis.call('DEL', KEYS[1])
+return #family_ids
+"""
+
+
 async def _invalidate_all_sessions(redis: Redis, user_id: str) -> None:
-    """탈취 감지 시 해당 사용자의 모든 세션 무효화."""
-    family_ids = await redis.smembers(f"{USER_FAMILIES_PREFIX}{user_id}")
-    if not family_ids:
-        return
-    pipe = redis.pipeline()
-    for family_id in family_ids:
-        current_token = await redis.get(f"{TOKEN_FAMILY_PREFIX}{family_id}")
-        if current_token:
-            pipe.delete(f"{REFRESH_TOKEN_PREFIX}{current_token}")
-        pipe.delete(f"{TOKEN_FAMILY_PREFIX}{family_id}")
-    pipe.delete(f"{USER_FAMILIES_PREFIX}{user_id}")
-    await pipe.execute()
-    logger.warning("all_sessions_invalidated", user_id=user_id)
+    """탈취 감지 시 해당 사용자의 모든 세션 무효화. Lua 스크립트로 원자적 실행."""
+    invalidate_script = redis.register_script(_INVALIDATE_ALL_SESSIONS_SCRIPT)
+    count = await invalidate_script(keys=[f"{USER_FAMILIES_PREFIX}{user_id}"])
+    if count:
+        logger.warning("all_sessions_invalidated", user_id=user_id, session_count=count)
 ```
 
 **Refresh Token Rotation + Replay Detection:**
@@ -574,7 +722,13 @@ class TokenPayload(BaseModel):
 ```python
 # api/v1/endpoints/auth.py
 from fastapi import APIRouter, Depends, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.redis import get_redis
+from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
+from app.services import auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -582,25 +736,27 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def login(
     body: LoginRequest,
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> TokenResponse:
     """이메일/비밀번호 인증 → access_token + refresh_token JSON 반환.
     BFF가 쿠키를 설정한다 (Backend는 Set-Cookie 사용 안 함)."""
-    ...
+    return await auth_service.login(db, redis, body=body)
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh(
     body: RefreshRequest,
-    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> TokenResponse:
     """refresh_token을 body로 수신 → 검증 → Rotation(기존 삭제 + 신규 발급)."""
-    ...
+    return await auth_service.refresh(redis, refresh_token=body.refresh_token)
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     body: RefreshRequest,
+    redis: Redis = Depends(get_redis),
 ) -> None:
     """refresh_token을 body로 수신 → Redis에서 삭제 → 204 No Content."""
-    ...
+    await auth_service.logout(redis, refresh_token=body.refresh_token)
 ```
 
 ### 3.3 Security 함수 구현
@@ -706,10 +862,39 @@ async def get_current_user(
 ### 4.1 Create / Update / Response 패턴
 
 ```python
+import re
+from pydantic import field_validator
+
+
+def validate_password(password: str) -> str:
+    """비밀번호 정책: 8-72자, 소문자/대문자/숫자/특수문자 중 3종 이상."""
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    if len(password) > 72:
+        raise ValueError("Password must be at most 72 characters")
+    checks = [
+        bool(re.search(r"[a-z]", password)),
+        bool(re.search(r"[A-Z]", password)),
+        bool(re.search(r"\d", password)),
+        bool(re.search(r'[!@#$%^&*(),.?":{}|<>]', password)),
+    ]
+    if sum(checks) < 3:
+        raise ValueError(
+            "Password must contain at least 3 of: lowercase, uppercase, digit, special character"
+        )
+    return password
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
     name: str
+
+    @field_validator("password")
+    @classmethod
+    def check_password(cls, v: str) -> str:
+        return validate_password(v)
+
 
 class UserUpdate(BaseModel):
     name: str | None = None

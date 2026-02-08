@@ -11,6 +11,25 @@
 
 BFF 프록시는 Backend에서 401 응답을 받으면 자동으로 토큰 갱신을 시도합니다 (Silent Refresh). 갱신 성공 시 새 쿠키를 설정하고 원래 요청을 재시도합니다. 갱신 실패 시 쿠키를 삭제하고 401을 클라이언트에 전달합니다. 동시 다중 요청 시 refresh는 한 번만 실행됩니다 (Promise 캐싱).
 
+**BFF 경로 변환 규칙:**
+
+| 클라이언트 요청 | BFF 변환 | Backend 도착 |
+|----------------|----------|-------------|
+| `GET /api/users/me` | `/api` 제거 → `/users/me` | `BACKEND_URL/api/v1/users/me` |
+| `POST /api/users` | `/api` 제거 → `/users` | `BACKEND_URL/api/v1/users` |
+| `GET /api/users?page=1` | query string 유지 | `BACKEND_URL/api/v1/users?page=1` |
+
+인증 전용 라우트(`/api/auth/*`)는 `[...path]` catch-all에 도달하기 전에 전용 Route Handler(`/api/auth/login/route.ts` 등)가 먼저 매칭됩니다.
+
+**401 처리 전략 (2단계):**
+
+| 단계 | 위치 | 동작 | 조건 |
+|------|------|------|------|
+| 1차 | BFF 프록시 (서버 측) | Silent Refresh 시도 → 성공 시 새 쿠키 설정 + 원래 요청 재시도 | refresh_token 쿠키 존재 |
+| 2차 | QueryClient (클라이언트 측) | `/login` 리다이렉트 | BFF가 401을 그대로 전달한 경우 (refresh 실패 또는 refresh_token 없음) |
+
+클라이언트에 401이 도달하는 것은 "refresh도 실패한, 완전히 인증이 만료된 상황"만 해당합니다.
+
 ```typescript
 // frontend/src/app/api/[...path]/route.ts
 import { cookies } from "next/headers";
@@ -35,6 +54,10 @@ function filterHeaders(headers: Headers): Headers {
 }
 
 // Silent Refresh 동시성 제어
+// NOTE: 서버리스 환경(Vercel)에서는 각 요청이 별도 인스턴스에서 실행될 수 있어
+// 이 모듈 레벨 변수는 인스턴스 간 공유되지 않습니다.
+// 같은 인스턴스 내 동시 요청에 대한 dedup 역할만 수행합니다.
+// 이는 의도된 설계이며, 다른 인스턴스의 중복 refresh는 Token Rotation으로 안전하게 처리됩니다.
 let refreshPromise: Promise<RefreshResult> | null = null;
 
 interface RefreshResult {
@@ -286,17 +309,40 @@ export async function POST() {
 }
 ```
 
+**Login 후 사용자 정보 획득 흐름:**
+
+1. `POST /api/auth/login` (BFF) 성공 → 쿠키 설정 완료
+2. 로그인 성공 콜백에서 `queryClient.invalidateQueries({ queryKey: userKeys.me() })` 호출
+3. TanStack Query가 `GET /api/users/me` → BFF → Backend 요청
+4. Backend가 JWT에서 user_id 추출 → User 조회 → UserResponse 반환
+
 ### 1.3 Query Key Factory
 
 ```typescript
 // hooks/queries/keys.ts
 export const userKeys = {
   all: ["users"] as const,
+  me: () => [...userKeys.all, "me"] as const,
   lists: () => [...userKeys.all, "list"] as const,
   list: (params: UserListParams) => [...userKeys.lists(), params] as const,
   details: () => [...userKeys.all, "detail"] as const,
   detail: (id: string) => [...userKeys.details(), id] as const,
 };
+```
+
+```typescript
+// hooks/queries/use-current-user.ts
+import { useQuery } from "@tanstack/react-query";
+import { getMe } from "@/client/sdk.gen";
+import { userKeys } from "./keys";
+
+export function useCurrentUser() {
+  return useQuery({
+    queryKey: userKeys.me(),
+    queryFn: () => getMe(),
+    staleTime: 5 * 60 * 1000,
+  });
+}
 ```
 
 ### 1.4 Custom Hook 패턴
@@ -367,6 +413,9 @@ const PUBLIC_ROUTES = ["/", "/login", "/register", "/about"];
 // 로그인 사용자가 접근하면 /dashboard로 리다이렉트할 라우트
 const AUTH_REDIRECT_ROUTES = ["/login", "/register"];
 
+// 주의: PUBLIC_ROUTES에 "/about"을 추가하면 "/about/settings" 등
+// 하위 경로도 모두 공개됩니다. 특정 경로만 공개하려면
+// startsWith 조건을 제거하고 정확한 매칭(pathname === route)만 사용하세요.
 function isPublicRoute(pathname: string): boolean {
   return PUBLIC_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(`${route}/`),
@@ -406,20 +455,52 @@ BFF 프록시의 핵심 동작(인증 헤더 전달, Silent Refresh, 에러 전�
 
 ```typescript
 // src/tests/bff-proxy.test.ts
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
+import { NextRequest } from "next/server";
 
 const BACKEND_URL = "http://backend:8000";
-
 const server = setupServer();
 
+// next/headers 모킹 — cookies() 반환값 제어
+const mockCookieStore = {
+  get: vi.fn(),
+  set: vi.fn(),
+  delete: vi.fn(),
+};
+
+vi.mock("next/headers", () => ({
+  cookies: vi.fn(() => Promise.resolve(mockCookieStore)),
+}));
+
+function createMockRequest(
+  path: string,
+  options: { method?: string; body?: unknown } = {},
+): NextRequest {
+  const { method = "GET", body } = options;
+  const init: RequestInit = { method };
+  if (body) {
+    init.body = JSON.stringify(body);
+    init.headers = { "Content-Type": "application/json" };
+  }
+  return new NextRequest(`http://localhost:3000/api${path}`, init);
+}
+
 beforeAll(() => server.listen());
-afterEach(() => server.resetHandlers());
+afterEach(() => {
+  server.resetHandlers();
+  vi.clearAllMocks();
+});
 afterAll(() => server.close());
 
 describe("BFF Proxy", () => {
   it("should forward authorization header from cookie", async () => {
+    mockCookieStore.get.mockImplementation((name: string) => {
+      if (name === "access_token") return { value: "test-access-token" };
+      return undefined;
+    });
+
     let capturedAuth: string | null = null;
     server.use(
       http.get(`${BACKEND_URL}/api/v1/users/me`, ({ request }) => {
@@ -428,48 +509,122 @@ describe("BFF Proxy", () => {
       }),
     );
 
-    // Route Handler를 직접 import하여 테스트
-    // 실제 구현 시 NextRequest 모킹이 필요할 수 있음
-    expect(capturedAuth).toBe("Bearer test-token");
+    const { GET } = await import("@/app/api/[...path]/route");
+    const req = createMockRequest("/users/me");
+    const response = await GET(req);
+
+    expect(response.status).toBe(200);
+    expect(capturedAuth).toBe("Bearer test-access-token");
   });
 
   it("should attempt silent refresh on 401", async () => {
+    mockCookieStore.get.mockImplementation((name: string) => {
+      if (name === "access_token") return { value: "expired-token" };
+      if (name === "refresh_token") return { value: "valid-refresh-token" };
+      return undefined;
+    });
+
     let refreshCalled = false;
     server.use(
       http.get(`${BACKEND_URL}/api/v1/users/me`, () => {
-        return HttpResponse.json({}, { status: 401 });
+        return HttpResponse.json(
+          { error: { code: "UNAUTHORIZED", message: "Expired" } },
+          { status: 401 },
+        );
       }),
       http.post(`${BACKEND_URL}/api/v1/auth/refresh`, () => {
         refreshCalled = true;
         return HttpResponse.json({
-          access_token: "new-access",
-          refresh_token: "new-refresh",
+          access_token: "new-access-token",
+          refresh_token: "new-refresh-token",
         });
       }),
     );
 
-    // ... 프록시 호출 후
+    const { GET } = await import("@/app/api/[...path]/route");
+    const req = createMockRequest("/users/me");
+    await GET(req);
+
     expect(refreshCalled).toBe(true);
+    expect(mockCookieStore.set).toHaveBeenCalledWith(
+      "access_token",
+      "new-access-token",
+      expect.objectContaining({ httpOnly: true }),
+    );
   });
 
   it("should return 502 when backend is unavailable", async () => {
+    mockCookieStore.get.mockReturnValue(undefined);
     server.use(
       http.get(`${BACKEND_URL}/api/v1/users/me`, () => {
         return HttpResponse.error();
       }),
     );
 
-    // ... 프록시 호출 후
-    // response.status === 502, body.error.code === "BAD_GATEWAY"
+    const { GET } = await import("@/app/api/[...path]/route");
+    const req = createMockRequest("/users/me");
+    const response = await GET(req);
+
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body.error.code).toBe("BAD_GATEWAY");
   });
 });
 ```
 
 **테스트 전략:**
 - MSW로 Backend 응답 모킹 (네트워크 레벨 인터셉트)
-- Next.js Route Handler는 순수 함수로 import하여 테스트
-- `NextRequest`/`NextResponse` 모킹: `next/server`에서 직접 생성 가능
-- 쿠키 검증: 응답의 `Set-Cookie` 헤더 확인
+- NextRequest 직접 생성: `new NextRequest(url, init)`
+- next/headers 모킹: `vi.mock("next/headers")` + mockCookieStore
+- Route Handler dynamic import: `await import("@/app/api/[...path]/route")`
+- 쿠키 검증: `mockCookieStore.set` 호출 확인
+
+### 1.9 Root Layout
+
+```typescript
+// frontend/src/app/layout.tsx
+import type { Metadata } from "next";
+import { Toaster } from "sonner";
+import { Providers } from "./providers";
+import "@/app/globals.css";
+
+export const metadata: Metadata = {
+  title: { default: "App", template: "%s | App" },
+  description: "Fullstack Template",
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="ko" suppressHydrationWarning>
+      <body>
+        <Providers>{children}</Providers>
+        <Toaster position="top-right" richColors />
+      </body>
+    </html>
+  );
+}
+```
+
+```typescript
+// frontend/src/app/providers.tsx
+"use client";
+
+import { QueryClientProvider } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { useState } from "react";
+import { createQueryClient } from "@/lib/query-client";
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => createQueryClient());
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
+}
+```
 
 ---
 
@@ -606,12 +761,24 @@ export async function parseApiError(response: Response): Promise<ApiError> {
 
 ```typescript
 // frontend/src/lib/query-client.ts
-import { QueryClient } from "@tanstack/react-query";
+import { QueryCache, QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ApiError } from "./api-error";
 
 export function createQueryClient() {
   return new QueryClient({
+    queryCache: new QueryCache({
+      onError: (error) => {
+        if (error instanceof ApiError && error.status === 401) {
+          if (typeof window !== "undefined") {
+            window.location.replace("/login");
+          }
+          return;
+        }
+        // queries 에러는 컴포넌트 error boundary에서 처리하므로
+        // 여기서는 401 리다이렉트만 담당
+      },
+    }),
     defaultOptions: {
       queries: { retry: false },
       mutations: {

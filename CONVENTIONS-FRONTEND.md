@@ -33,7 +33,7 @@ src/app/
 │   │       └── route.ts         # 로그아웃 → 쿠키 삭제
 │   └── [...path]/
 │       └── route.ts             # 범용 프록시
-├── layout.tsx                   # 루트 레이아웃 (Providers)
+├── layout.tsx                   # 루트 레이아웃 (Providers) — 구현 코드는 SPECS-FRONTEND.md §1.9 참조
 ├── page.tsx                     # 홈페이지
 ├── loading.tsx                  # 글로벌 로딩
 ├── error.tsx                    # 글로벌 에러

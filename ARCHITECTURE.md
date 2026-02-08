@@ -118,6 +118,7 @@ fullstack-template/
 │   │   │   ├── v1/
 │   │   │   │   ├── endpoints/   # API 엔드포인트 모듈
 │   │   │   │   │   ├── auth.py
+│   │   │   │   │   ├── health.py
 │   │   │   │   │   └── users.py
 │   │   │   │   └── router.py    # v1 라우터 집합
 │   │   │   └── dependencies.py  # 공유 의존성 (인증 등)
@@ -127,7 +128,9 @@ fullstack-template/
 │   │   │   ├── database.py      # DB 엔진 & 세션
 │   │   │   ├── redis.py         # Redis 연결 & 세션
 │   │   │   ├── exceptions.py    # 커스텀 예외 계층
-│   │   │   └── rate_limit.py    # Rate Limiting (slowapi)
+│   │   │   ├── rate_limit.py    # Rate Limiting (slowapi)
+│   │   │   ├── logging.py       # structlog 초기 설정
+│   │   │   └── middleware.py    # RequestIdMiddleware
 │   │   ├── models/              # SQLAlchemy 모델
 │   │   │   ├── base.py          # Base, TimestampMixin
 │   │   │   └── user.py
@@ -201,7 +204,7 @@ fullstack-template/
 
 **핵심 동작:** 쿠키에서 access_token 추출 → Authorization 헤더 첨부 → Backend로 프록시.
 
-프록시 구현 코드는 [SPECS-FRONTEND.md §1.1](./SPECS-FRONTEND.md#11-bff-프록시)을 참조하세요.
+프록시 구현 코드 및 경로 변환 규칙은 [SPECS-FRONTEND.md §1.1](./SPECS-FRONTEND.md#11-bff-프록시)을 참조하세요.
 
 ### 4.2 JWT 인증 흐름
 
