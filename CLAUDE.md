@@ -110,9 +110,18 @@ Import 규칙, 타입 안전성 등 코드 스타일은 아래 문서를 따른�
 
 ## 스킬 참조
 
-추가 가이드라인이 필요하면 `.agents/skills/` 디렉토리의 스킬을 참조한다:
+추가 가이드라인이 필요하면 아래 스킬을 참조한다:
 
-- `fastapi-templates` — Backend 아키텍처 패턴
-- `vercel-react-best-practices` — React/Next.js 57개 성능 규칙
-- `python-patterns` — Python async/testing 패턴
-- `supabase-postgres-best-practices` — PostgreSQL 최적화 30개 가이드
+**Backend** (`.agents/skills/`):
+- `fastapi-templates` — FastAPI 프로젝트 구조, async 패턴, 의존성 주입, 에러 처리
+- `python-patterns` — Python 개발 원칙, async 패턴, 타입 힌트, 프로젝트 구조
+- `supabase-postgres-best-practices` — PostgreSQL 쿼리 최적화, 인덱스, 커넥션 관리 (30개 규칙)
+
+**Frontend** (`.agents/skills/`):
+- `next-best-practices` — Next.js 파일 컨벤션, RSC 경계, 데이터 패턴, 메타데이터, 번들 최적화
+- `vercel-react-best-practices` — React/Next.js 성능 최적화 (Vercel 엔지니어링 가이드, 57개 규칙)
+- `frontend-design` — UI 컴포넌트/페이지 제작 시 디자인 품질 가이드
+- `web-design-guidelines` — UI 코드 리뷰, 접근성 감사, UX 베스트 프랙티스
+
+**Frontend — UI/UX** (plugin):
+- `/ui-ux-pro-max` — UI/UX 디자인 (50개 스타일, 21개 팔레트, 50개 폰트 페어링, shadcn/ui 통합)
