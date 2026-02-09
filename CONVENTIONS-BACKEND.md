@@ -1,7 +1,7 @@
 # Backend Conventions
 
 > 공통 컨벤션(네이밍, Git, API 규격 등)은 [CONVENTIONS.md](./CONVENTIONS.md)를 참조하세요.
-> 참조 구현 코드(보일러플레이트)는 [SPECS-BACKEND.md](./SPECS-BACKEND.md)를 참조하세요.
+> 참조 구현 코드는 [SPECS-BACKEND.md](./SPECS-BACKEND.md)를 참조하세요.
 
 ---
 
@@ -22,6 +22,7 @@ Router(HTTP) → Service(비즈니스) → Repository(데이터) 계층을 엄�
 - 비즈니스 로직을 처리하고 여러 Repository를 조합
 - 트랜잭션은 `get_db()` 세션 컨텍스트가 관리 (Service에서 commit/rollback 호출 금지)
 - Redis 접근(캐시/세션)은 Service에서 직접 수행, 복잡해지면 별도 Repository로 분리
+- Redis 접근 원칙 상세는 [ARCHITECTURE.md §5.2](./ARCHITECTURE.md#52-3-layer-아키텍처)를 참조
 
 **async/await 필수:**
 - 모든 DB 작업은 async (`AsyncSession`, `asyncpg`)
@@ -84,38 +85,30 @@ Create / Update / Response 스키마를 분리합니다.
 
 ---
 
-## 4. JWT 인증 상세
+## 4. JWT 인증
 
-인증 흐름 및 토큰 구조는 [ARCHITECTURE.md §4.2](./ARCHITECTURE.md#42-jwt-인증-흐름)를 참조하세요.
-Security 함수 구현과 인증 의존성 코드는 [SPECS-BACKEND.md §3](./SPECS-BACKEND.md#3-auth)를 참조하세요.
-
-**인증 규칙:**
-- 토큰 구성 및 흐름은 [ARCHITECTURE.md §4.2](./ARCHITECTURE.md#42-jwt-인증-흐름) 참조
-- `OAuth2PasswordBearer` + `Depends`로 인증 주입
-- 인증 실패 시 401 `UNAUTHORIZED` 반환
+이 프로젝트는 JWT(HS256) + Refresh Token Rotation 기반 인증을 사용합니다. JWT 라이브러리는 PyJWT(`import jwt`)를 사용합니다. 인증/인가의 전체 설계(토큰 구성, Token Rotation, Replay Detection, 쿠키 전략), 규칙, 참조 구현은 [AUTH.md](./AUTH.md)를 참조하세요.
 
 ---
 
 ## 5. 에러 응답 포맷
 
-에러 JSON 포맷과 커스텀 예외 계층은 [ARCHITECTURE.md §4.3](./ARCHITECTURE.md#43-에러-핸들링)을 참조하세요.
-에러 스키마 구현 코드는 [SPECS-BACKEND.md §1.5](./SPECS-BACKEND.md#15-error-schemas--exception-hierarchy)를 참조하세요.
+통합 에러 JSON 포맷(`ErrorResponse`)을 사용합니다. 에러 계층 구조는 [ARCHITECTURE.md §4.3](./ARCHITECTURE.md#43-에러-핸들링), 구현 코드는 [SPECS-BACKEND.md §1.5](./SPECS-BACKEND.md#15-error-schemas--exception-hierarchy)를 참조하세요.
 
 **규칙:**
 - 모든 커스텀 예외는 `AppException`을 상속
 - `RequestValidationError` → 422 `VALIDATION_ERROR`로 변환
-- `main.py`에 `@app.exception_handler(AppException)`, `@app.exception_handler(RequestValidationError)` 등록
+- `main.py`에 exception handler 등록 필수
 - Frontend에서 `error.code` 값으로 분기하여 사용자 메시지 표시
 
 ---
 
 ## 6. DB 모델 / 마이그레이션
 
-Base 모델과 TimestampMixin 구현 코드는 [SPECS-BACKEND.md §1.4](./SPECS-BACKEND.md#14-base-model--timestampmixin)를 참조하세요.
-마이그레이션 워크플로우는 [ARCHITECTURE.md §4.4](./ARCHITECTURE.md#44-db-마이그레이션)를 참조하세요.
+구현 코드(Base, TimestampMixin)는 [SPECS-BACKEND.md §1.4](./SPECS-BACKEND.md#14-base-model--timestampmixin)를 참조하세요.
 
 **규칙:**
-- 모든 테이블은 UUID v4를 Primary Key로 사용 (`uuid.uuid4` default)
+- PK 전략은 [ARCHITECTURE.md §4.4](./ARCHITECTURE.md#44-db-마이그레이션) 참조 (UUID v4)
 - 모든 `datetime`은 UTC로 저장/전송, `DateTime(timezone=True)` 필수
 - FK 컬럼에 `index=True` 필수 (JOIN 성능)
 - Alembic 마이그레이션은 `--autogenerate`로 생성, 의미 있는 메시지 작성
@@ -152,7 +145,7 @@ tests/
 - `db_session` (function scope): 매 테스트마다 `create_all` → yield session → `drop_all`
 - `client` (function scope): `AsyncClient` + `app.dependency_overrides[get_db]` 오버라이드
 
-**커버리지 기준:** [CONVENTIONS.md §6.2](./CONVENTIONS.md#62-커버리지-기준) 참조.
+**FakeRedis + Lua 테스트:** `fakeredis[lua]` 패키지를 사용하면 Lua 스크립트(Token Rotation 등)를 실제 Redis 없이 인메모리로 테스트할 수 있습니다. `conftest.py`의 `FakeRedis(decode_responses=True)` 인스턴스가 Lua 스크립트를 지원합니다.
 
 **네이밍 규칙:**
 - 파일: `test_{module}.py`
@@ -213,32 +206,7 @@ logger.info("login_success", user_id=str(user.id))
 logger.warning("token_replay_detected", user_id=user_id_str, family_id=family_id)
 ```
 
-**로그 포맷 예시:**
-
-```json
-{
-  "event": "login_success",
-  "level": "info",
-  "timestamp": "2024-01-15T10:30:45.123Z",
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "request_id": "abc123",
-  "ip": "192.168.1.100"
-}
-```
-
-**주요 로깅 지점:**
-
-| 이벤트 | 레벨 | 필수 필드 |
-|--------|------|----------|
-| 로그인 성공 | INFO | `user_id` |
-| 로그인 실패 | INFO | `email`, `reason` (invalid_credentials/inactive_account) |
-| 토큰 갱신 | INFO | `user_id` |
-| Replay 토큰 의심 | WARNING | `token_prefix` (앞 8자) |
-| Replay 토큰 확정 | WARNING | `user_id`, `family_id` |
-| 전체 세션 무효화 | WARNING | `user_id` |
-| Rate limit 초과 | WARNING | `ip`, `endpoint` |
-| API 요청 | INFO | `method`, `path`, `status_code`, `duration` |
-| 예외 발생 | ERROR | `exception`, `traceback` |
+로그 포맷 예시와 주요 로깅 지점은 [SPECS-BACKEND.md §5](./SPECS-BACKEND.md#5-로깅-참조)를 참조하세요.
 
 **로깅 규칙:**
 
@@ -267,5 +235,5 @@ class Settings(BaseSettings):
 | 과도한 DEBUG 로그 (운영) | 디스크 사용량 증가, 성능 저하 |
 
 **참조:**
-- AuthService 로깅 예시: [SPECS-BACKEND.md §2.2](./SPECS-BACKEND.md#22-authservice-참조-구현)
+- AuthService 로깅 예시: [SPECS-BACKEND.md §3.3](./SPECS-BACKEND.md#33-authservice)
 - Settings 필드: [SPECS-BACKEND.md §1.2](./SPECS-BACKEND.md#12-settings)

@@ -1,7 +1,7 @@
 # Frontend Conventions
 
 > 공통 컨벤션(네이밍, Git, API 규격 등)은 [CONVENTIONS.md](./CONVENTIONS.md)를 참조하세요.
-> 참조 구현 코드(보일러플레이트)는 [SPECS-FRONTEND.md](./SPECS-FRONTEND.md)를 참조하세요.
+> 참조 구현 코드는 [SPECS-FRONTEND.md](./SPECS-FRONTEND.md)를 참조하세요.
 
 ---
 
@@ -27,13 +27,15 @@ src/app/
 │   ├── auth/                    # 인증 전용 BFF 라우트
 │   │   ├── login/
 │   │   │   └── route.ts         # 로그인 → 쿠키 설정
+│   │   ├── register/
+│   │   │   └── route.ts         # 회원가입 → 자동 로그인
 │   │   ├── refresh/
 │   │   │   └── route.ts         # 토큰 갱신 → 쿠키 교체
 │   │   └── logout/
 │   │       └── route.ts         # 로그아웃 → 쿠키 삭제
 │   └── [...path]/
 │       └── route.ts             # 범용 프록시
-├── layout.tsx                   # 루트 레이아웃 (Providers) — 구현 코드는 SPECS-FRONTEND.md §1.9 참조
+├── layout.tsx                   # 루트 레이아웃 (Providers) — 구현 코드는 SPECS-FRONTEND.md §1.10 참조
 ├── page.tsx                     # 홈페이지
 ├── loading.tsx                  # 글로벌 로딩
 ├── error.tsx                    # 글로벌 에러
@@ -68,7 +70,7 @@ src/app/
 - React 19: `forwardRef` 대신 `ref`를 prop으로 직접 전달
 
 **인증 라우트 보호:**
-`middleware.ts`로 인증 라우트를 보호합니다. 구현 코드는 [SPECS-FRONTEND.md §1.7](./SPECS-FRONTEND.md#17-인증-미들웨어)을 참조하세요.
+`middleware.ts`로 인증 라우트를 보호합니다. 구현 코드는 [SPECS-FRONTEND.md §1.7](./SPECS-FRONTEND.md#17-인증-미들웨어)를 참조하세요.
 
 ---
 
@@ -107,9 +109,9 @@ export function LoginForm({ onSuccess }: LoginFormProps) {
 
 ## 3. TanStack Query 패턴
 
-**Query Key Factory** — 구현 코드는 [SPECS-FRONTEND.md §1.3](./SPECS-FRONTEND.md#13-query-key-factory)를 참조하세요.
+**Query Key Factory** — 구현 코드는 [SPECS-FRONTEND.md §1.4](./SPECS-FRONTEND.md#14-query-key-factory)를 참조하세요.
 
-**Custom Hook 캡슐화** — 구현 코드는 [SPECS-FRONTEND.md §1.4](./SPECS-FRONTEND.md#14-custom-hook-패턴)을 참조하세요.
+**Custom Hook 캡슐화** — 구현 코드는 [SPECS-FRONTEND.md §1.5](./SPECS-FRONTEND.md#15-custom-hook-패턴)을 참조하세요.
 
 **규칙:**
 - 컴포넌트에서 `useQuery`/`useMutation` 직접 호출 금지 → 반드시 커스텀 훅으로 캡슐화
@@ -122,7 +124,7 @@ export function LoginForm({ onSuccess }: LoginFormProps) {
 
 shadcn/ui 테마는 Tailwind v4 CSS-first 방식으로 `globals.css`에서 OKLCH CSS 변수로 정의합니다.
 
-**cn() 유틸리티** — `lib/utils.ts`의 `cn()` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.5](./SPECS-FRONTEND.md#15-cn-유틸리티)를 참조하세요.
+**cn() 유틸리티** — `lib/utils.ts`의 `cn()` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.6](./SPECS-FRONTEND.md#16-cn-유틸리티)를 참조하세요.
 
 **규칙:**
 - Tailwind v4는 CSS-first 설정 — `tailwind.config.ts` 불필요 (`globals.css`의 `@theme`/`@custom-variant` 사용)
@@ -130,6 +132,12 @@ shadcn/ui 테마는 Tailwind v4 CSS-first 방식으로 `globals.css`에서 OKLCH
 - 조건부 클래스는 `cn()` 유틸리티 사용
 - 반응형 디자인은 mobile-first (`sm:`, `md:`, `lg:`)
 - 다크모드는 CSS 변수 기반 (`@custom-variant dark`)
+
+**다크모드 전환 전략:**
+- class 기반 토글: `<html>` 태그의 `dark` 클래스로 전환 (`@custom-variant dark (&:where(.dark, .dark *))`)
+- 초기값: `prefers-color-scheme` 미디어 쿼리로 시스템 설정을 감지하여 초기 테마 결정
+- 저장: `localStorage`에 사용자 선택을 저장하여 재방문 시 유지
+- FOUC 방지: `<head>`의 인라인 스크립트에서 `localStorage` 값을 읽어 `html.dark` 클래스를 동기적으로 적용 (Next.js `<html suppressHydrationWarning>` 필수)
 
 ---
 
@@ -164,7 +172,7 @@ Backend의 OpenAPI 스펙에서 타입과 API 클라이언트를 자동 생성�
 
 **설정:** `vitest.config.ts`에서 `environment: "jsdom"`, `setupFiles: ["./src/tests/setup.ts"]` 설정.
 
-**Wrapper fixture** — `src/tests/utils.tsx`의 `renderWithProviders` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.6](./SPECS-FRONTEND.md#16-테스트-wrapper)를 참조하세요.
+**Wrapper fixture** — `src/tests/utils.tsx`의 `renderWithProviders` 사용. 구현 코드는 [SPECS-FRONTEND.md §1.8](./SPECS-FRONTEND.md#18-테스트-wrapper)를 참조하세요.
 
 **규칙:**
 - 사용자 행동 기반 테스트 (`getByRole`, `getByLabelText`) — `getByTestId` 최후 수단
@@ -205,10 +213,6 @@ export class LoginPage {
 ```
 
 **Locator 전략:** `getByRole`, `getByLabel` 우선 사용 (RTL과 일관). `getByTestId`는 최후 수단.
-
-### 7.3 커버리지 기준
-
-[CONVENTIONS.md §6.2](./CONVENTIONS.md#62-커버리지-기준) 참조.
 
 ---
 

@@ -1,6 +1,6 @@
 # Frontend Reference Specifications
 
-> 이 문서는 Frontend에서 사용하는 **참조 구현 코드(보일러플레이트)**를 모아둔 것입니다.
+> 이 문서는 Frontend에서 사용하는 **참조 구현 코드**를 모아둔 것입니다.
 > 규칙과 컨벤션은 [CONVENTIONS-FRONTEND.md](./CONVENTIONS-FRONTEND.md)를 참조하세요.
 
 ---
@@ -36,9 +36,9 @@ openapi-ts SDK가 생성하는 경로에는 `/v1/` prefix가 포함되므로(Ope
 // frontend/src/app/api/[...path]/route.ts
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
+import { clearAuthCookies, setAuthCookies } from "@/lib/auth-cookies";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -62,7 +62,7 @@ function filterHeaders(headers: Headers): Headers {
 // 이는 의도된 설계이며, 다른 인스턴스의 중복 refresh는 Token Rotation으로 안전하게 처리됩니다.
 // NOTE: Backend의 refresh rotation에 10초 grace period가 적용되어 있어,
 // 서버리스 환경에서 여러 인스턴스가 동시에 같은 refresh_token으로 요청하더라도
-// grace period 내에는 정상 처리됩니다 (SPECS-BACKEND.md §2.2 참조).
+// grace period 내에는 정상 처리됩니다 (AUTH.md §4.4 참조).
 let refreshPromise: Promise<RefreshResult> | null = null;
 
 interface RefreshResult {
@@ -138,19 +138,9 @@ async function proxyRequest(req: NextRequest) {
         const result = await refreshTokens(refreshToken);
 
         if (result.success && result.accessToken && result.refreshToken) {
-          cookieStore.set("access_token", result.accessToken, {
-            httpOnly: true,
-            secure: IS_PRODUCTION,
-            sameSite: "lax",
-            path: "/",
-            maxAge: 900,
-          });
-          cookieStore.set("refresh_token", result.refreshToken, {
-            httpOnly: true,
-            secure: IS_PRODUCTION,
-            sameSite: "lax",
-            path: "/api/auth",
-            maxAge: 604800,
+          setAuthCookies(cookieStore, {
+            access_token: result.accessToken,
+            refresh_token: result.refreshToken,
           });
 
           // 새 access_token으로 원래 요청 재시도
@@ -163,13 +153,11 @@ async function proxyRequest(req: NextRequest) {
 
           // 재시도 후에도 401이면 쿠키 삭제 (사용자 비활성화 등의 사유)
           if (response.status === 401) {
-            cookieStore.delete("access_token");
-            cookieStore.delete("refresh_token");
+            clearAuthCookies(cookieStore);
           }
         } else {
           // refresh 실패 → 쿠키 삭제, 401 그대로 전달
-          cookieStore.delete("access_token");
-          cookieStore.delete("refresh_token");
+          clearAuthCookies(cookieStore);
         }
       }
     }
@@ -192,22 +180,57 @@ export const PATCH = proxyRequest;
 export const DELETE = proxyRequest;
 ```
 
-### 1.2 BFF 인증 라우트
+### 1.2 쿠키 헬퍼
 
-Backend는 JSON body로 토큰을 반환하고, BFF가 쿠키를 설정합니다. 클라이언트에는 토큰을 노출하지 않습니다.
-
-> **쿠키 path 전략:** `refresh_token`의 path를 `/api/auth`로 제한하여 일반 API 요청에 불필요하게 전송되지 않도록 합니다.
-> BFF 프록시(`[...path]/route.ts`)에서 Silent Refresh 시 `cookies()`로 refresh_token을 읽는 것은 서버 사이드에서 실행되므로
-> 브라우저의 쿠키 path 제한과 무관하게 모든 쿠키에 접근할 수 있습니다.
-> 즉, `path=/api/auth`는 브라우저→서버 전송만 제한하고, 서버 사이드의 `cookies()` API 접근은 제한하지 않습니다.
+인증 쿠키 설정/삭제를 단일 함수로 추출하여 BFF 라우트 간 중복을 제거합니다.
 
 ```typescript
-// frontend/src/app/api/auth/login/route.ts
+// src/lib/auth-cookies.ts
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+interface AuthTokens {
+  access_token: string;
+  refresh_token: string;
+}
+
+type CookieStore = Awaited<ReturnType<typeof import("next/headers").cookies>>;
+
+export function setAuthCookies(cookieStore: CookieStore, tokens: AuthTokens): void {
+  cookieStore.set("access_token", tokens.access_token, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 900,
+  });
+  cookieStore.set("refresh_token", tokens.refresh_token, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: "lax",
+    path: "/api/auth",
+    maxAge: 604800,
+  });
+}
+
+export function clearAuthCookies(cookieStore: CookieStore): void {
+  cookieStore.delete("access_token");
+  cookieStore.delete("refresh_token");
+}
+```
+
+### 1.3 BFF 인증 라우트
+
+Backend는 JSON body로 토큰을 반환하고, BFF가 쿠키를 설정합니다. 클라이언트에는 토큰을 노출하지 않습니다. 모든 라우트에서 [§1.2 쿠키 헬퍼](#12-쿠키-헬퍼)를 사용합니다. 쿠키 전략 상세는 [AUTH.md §5](./AUTH.md#5-쿠키-전략)를 참조하세요.
+
+#### Login
+
+```typescript
+// src/app/api/auth/login/route.ts
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
+import { setAuthCookies } from "@/lib/auth-cookies";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -225,34 +248,21 @@ export async function POST(req: NextRequest) {
 
   const data = await response.json();
   const cookieStore = await cookies();
-
-  cookieStore.set("access_token", data.access_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 900,
-  });
-
-  cookieStore.set("refresh_token", data.refresh_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/api/auth",
-    maxAge: 604800,
-  });
+  setAuthCookies(cookieStore, data);
 
   return NextResponse.json({ token_type: "bearer" });
 }
 ```
 
+#### Refresh
+
 ```typescript
-// frontend/src/app/api/auth/refresh/route.ts
+// src/app/api/auth/refresh/route.ts
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { clearAuthCookies, setAuthCookies } from "@/lib/auth-cookies";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 export async function POST() {
   const cookieStore = await cookies();
@@ -272,38 +282,25 @@ export async function POST() {
   });
 
   if (!response.ok) {
-    cookieStore.delete("access_token");
-    cookieStore.delete("refresh_token");
+    clearAuthCookies(cookieStore);
     const error = await response.json();
     return NextResponse.json(error, { status: response.status });
   }
 
   const data = await response.json();
-
-  cookieStore.set("access_token", data.access_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 900,
-  });
-
-  cookieStore.set("refresh_token", data.refresh_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/api/auth",
-    maxAge: 604800,
-  });
+  setAuthCookies(cookieStore, data);
 
   return NextResponse.json({ token_type: "bearer" });
 }
 ```
 
+#### Logout
+
 ```typescript
-// frontend/src/app/api/auth/logout/route.ts
+// src/app/api/auth/logout/route.ts
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { clearAuthCookies } from "@/lib/auth-cookies";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
 
@@ -321,20 +318,21 @@ export async function POST() {
     });
   }
 
-  cookieStore.delete("access_token");
-  cookieStore.delete("refresh_token");
+  clearAuthCookies(cookieStore);
 
   return new NextResponse(null, { status: 204 });
 }
 ```
 
+#### Register (자동 로그인)
+
 ```typescript
 // src/app/api/auth/register/route.ts
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
+import { setAuthCookies } from "@/lib/auth-cookies";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -365,25 +363,35 @@ export async function POST(req: NextRequest) {
 
   const tokens = await loginRes.json();
   const cookieStore = await cookies();
-
-  // 3. 쿠키 설정 (login route와 동일)
-  cookieStore.set("access_token", tokens.access_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 900,
-  });
-  cookieStore.set("refresh_token", tokens.refresh_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/api/auth",
-    maxAge: 604800,
-  });
+  setAuthCookies(cookieStore, tokens);
 
   return NextResponse.json({ registered: true, autoLogin: true });
 }
+```
+
+**Register 자동 로그인 실패 시 클라이언트 처리:**
+
+BFF Register 라우트가 `{ registered: true, autoLogin: false }` (status 201)을 반환하면, 클라이언트에서 로그인 페이지로 안내합니다:
+
+```typescript
+// 회원가입 mutation onSuccess 핸들러
+const res = await fetch("/api/auth/register", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(data),
+});
+const result = await res.json();
+
+if (result.autoLogin === false) {
+  // 회원가입 성공, 자동 로그인 실패 → 로그인 페이지로 안내
+  toast.success("회원가입이 완료되었습니다. 로그인해주세요.");
+  router.push("/login");
+  return;
+}
+
+// 자동 로그인 성공 → 대시보드로 이동
+router.push("/dashboard");
+router.refresh();
 ```
 
 **Login 후 사용자 정보 획득 흐름:**
@@ -393,7 +401,7 @@ export async function POST(req: NextRequest) {
 3. TanStack Query가 `GET /api/users/me` → BFF → Backend 요청
 4. Backend가 JWT에서 user_id 추출 → User 조회 → UserResponse 반환
 
-### 1.3 Query Key Factory
+### 1.4 Query Key Factory
 
 ```typescript
 // hooks/queries/keys.ts
@@ -422,29 +430,11 @@ export function useCurrentUser() {
 }
 ```
 
-### 1.4 Custom Hook 패턴
+### 1.5 Custom Hook 패턴
 
-```typescript
-// hooks/queries/use-users.ts
-export function useUsers(params: UserListParams) {
-  return useQuery({
-    queryKey: userKeys.list(params),
-    queryFn: () => getUsers(params),
-  });
-}
+openapi-ts SDK와 연결하는 Custom Hook 패턴은 [§2.3 SDK → TanStack Query 연결 패턴](#23-sdk--tanstack-query-연결-패턴)을 참조하세요.
 
-export function useCreateUser() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: createUser,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: userKeys.lists() });
-    },
-  });
-}
-```
-
-### 1.5 cn() 유틸리티
+### 1.6 cn() 유틸리티
 
 ```typescript
 // lib/utils.ts
@@ -456,7 +446,52 @@ export function cn(...inputs: ClassValue[]) {
 }
 ```
 
-### 1.6 테스트 Wrapper
+### 1.7 인증 미들웨어
+
+```typescript
+// src/middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+// 미인증 사용자도 접근 가능한 공개 라우트 (화이트리스트)
+const PUBLIC_ROUTES = ["/", "/login", "/register", "/about"];
+
+// 로그인 사용자가 접근하면 /dashboard로 리다이렉트할 라우트
+const AUTH_REDIRECT_ROUTES = ["/login", "/register"];
+
+function isPublicRoute(pathname: string): boolean {
+  return PUBLIC_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
+
+export function middleware(req: NextRequest) {
+  const accessToken = req.cookies.get("access_token")?.value;
+  const { pathname } = req.nextUrl;
+
+  // 공개 라우트가 아닌 모든 라우트는 인증 필요 (기본 보호)
+  if (!isPublicRoute(pathname) && !accessToken) {
+    const loginUrl = new URL("/login", req.url);
+    loginUrl.searchParams.set("callbackUrl", `${pathname}${req.nextUrl.search}`);
+    return NextResponse.redirect(loginUrl);
+  }
+
+  // 로그인된 사용자가 인증 전용 라우트 접근 → /dashboard 리다이렉트
+  if (accessToken && AUTH_REDIRECT_ROUTES.some((route) => pathname === route)) {
+    return NextResponse.redirect(new URL("/dashboard", req.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    // static files, _next, api 제외
+    "/((?!_next/static|_next/image|favicon.ico|api/).*)",
+  ],
+};
+```
+
+### 1.8 테스트 Wrapper
 
 ```typescript
 // src/tests/utils.tsx
@@ -491,55 +526,7 @@ export function createWrapper() {
 }
 ```
 
-### 1.7 인증 미들웨어
-
-```typescript
-// frontend/src/middleware.ts
-import { NextRequest, NextResponse } from "next/server";
-
-// 미인증 사용자도 접근 가능한 공개 라우트 (화이트리스트)
-const PUBLIC_ROUTES = ["/", "/login", "/register", "/about"];
-
-// 로그인 사용자가 접근하면 /dashboard로 리다이렉트할 라우트
-const AUTH_REDIRECT_ROUTES = ["/login", "/register"];
-
-// 주의: PUBLIC_ROUTES에 "/about"을 추가하면 "/about/settings" 등
-// 하위 경로도 모두 공개됩니다. 특정 경로만 공개하려면
-// startsWith 조건을 제거하고 정확한 매칭(pathname === route)만 사용하세요.
-function isPublicRoute(pathname: string): boolean {
-  return PUBLIC_ROUTES.some(
-    (route) => pathname === route || pathname.startsWith(`${route}/`),
-  );
-}
-
-export function middleware(req: NextRequest) {
-  const accessToken = req.cookies.get("access_token")?.value;
-  const { pathname } = req.nextUrl;
-
-  // 공개 라우트가 아닌 모든 라우트는 인증 필요 (기본 보호)
-  if (!isPublicRoute(pathname) && !accessToken) {
-    const loginUrl = new URL("/login", req.url);
-    loginUrl.searchParams.set("callbackUrl", `${pathname}${req.nextUrl.search}`);
-    return NextResponse.redirect(loginUrl);
-  }
-
-  // 로그인된 사용자가 인증 전용 라우트 접근 → /dashboard 리다이렉트
-  if (accessToken && AUTH_REDIRECT_ROUTES.some((route) => pathname === route)) {
-    return NextResponse.redirect(new URL("/dashboard", req.url));
-  }
-
-  return NextResponse.next();
-}
-
-export const config = {
-  matcher: [
-    // static files, _next, api 제외
-    "/((?!_next/static|_next/image|favicon.ico|api/).*)",
-  ],
-};
-```
-
-### 1.8 BFF 프록시 테스트
+### 1.9 BFF 프록시 테스트
 
 BFF 프록시의 핵심 동작(인증 헤더 전달, Silent Refresh, 에러 전달)을 vitest로 테스트합니다. Backend는 MSW로 모킹합니다.
 
@@ -669,7 +656,7 @@ describe("BFF Proxy", () => {
 - Route Handler dynamic import: `await import("@/app/api/[...path]/route")`
 - 쿠키 검증: `mockCookieStore.set` 호출 확인
 
-### 1.9 Root Layout
+### 1.10 Root Layout
 
 ```typescript
 // frontend/src/app/layout.tsx
@@ -716,7 +703,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-### 1.10 에러/로딩 UI
+### 1.11 에러/로딩 UI
 
 #### error.tsx (글로벌 에러 바운더리)
 
@@ -767,7 +754,7 @@ export default function Loading() {
 }
 ```
 
-### 1.11 로그인 폼 컴포넌트
+### 1.12 로그인 폼 / Auth Hooks
 
 Auth 요청은 BFF 전용 라우트(`/api/auth/*`)를 직접 fetch로 호출합니다. openapi-ts SDK는 사용하지 않습니다.
 
@@ -779,8 +766,8 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useState } from "react";
 import { toast } from "sonner";
+import { useLogin } from "@/hooks/queries/use-auth";
 import { ApiError } from "@/lib/api-error";
 
 const loginSchema = z.object({
@@ -794,7 +781,7 @@ export function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const callbackUrl = searchParams.get("callbackUrl") ?? "/dashboard";
-  const [isLoading, setIsLoading] = useState(false);
+  const loginMutation = useLogin();
 
   const form = useForm<LoginFormValues>({
     resolver: zodResolver(loginSchema),
@@ -802,17 +789,8 @@ export function LoginForm() {
   });
 
   async function onSubmit(data: LoginFormValues) {
-    setIsLoading(true);
     try {
-      const res = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) {
-        const body = await res.json();
-        throw new ApiError(res.status, body.error);
-      }
+      await loginMutation.mutateAsync(data);
       router.push(callbackUrl);
       router.refresh();
     } catch (error) {
@@ -827,8 +805,6 @@ export function LoginForm() {
       } else {
         toast.error("로그인 중 오류가 발생했습니다.");
       }
-    } finally {
-      setIsLoading(false);
     }
   }
 
@@ -837,8 +813,8 @@ export function LoginForm() {
       {/* 실제 UI는 shadcn/ui Form 컴포넌트 사용 권장 */}
       <div>{/* email input */}</div>
       <div>{/* password input */}</div>
-      <button type="submit" disabled={isLoading}>
-        {isLoading ? "로그인 중..." : "로그인"}
+      <button type="submit" disabled={loginMutation.isPending}>
+        {loginMutation.isPending ? "로그인 중..." : "로그인"}
       </button>
     </form>
   );
@@ -888,7 +864,13 @@ export function useLogout() {
 }
 ```
 
-### 1.12 테스트 설정 + 컴포넌트/훅 테스트
+**Auth 요청 규칙:**
+- 로그인, 회원가입, 토큰 갱신, 로그아웃은 **BFF 전용 라우트**(`/api/auth/*`)를 `fetch()`로 직접 호출합니다
+- openapi-ts SDK가 생성하는 auth 함수(`login()`, `refresh()` 등)는 **사용하지 않습니다**
+  - SDK의 auth 함수는 BFF를 우회하므로 쿠키가 설정되지 않습니다
+- openapi-ts SDK는 **인증된 일반 API 요청**(users, posts 등)에만 사용합니다
+
+### 1.13 테스트 설정 + 컴포넌트/훅 테스트
 
 #### 테스트 설정
 
@@ -1045,11 +1027,7 @@ export function useCreateUser() {
 }
 ```
 
-**Auth 요청 규칙:**
-- 로그인, 회원가입, 토큰 갱신, 로그아웃은 **BFF 전용 라우트**(`/api/auth/*`)를 `fetch()`로 직접 호출합니다
-- openapi-ts SDK가 생성하는 auth 함수(`login()`, `refresh()` 등)는 **사용하지 않습니다**
-  - SDK의 auth 함수는 BFF를 우회하므로 쿠키가 설정되지 않습니다
-- openapi-ts SDK는 **인증된 일반 API 요청**(users, posts 등)에만 사용합니다
+Auth 요청 규칙(BFF fetch, SDK 미사용)은 [CONVENTIONS-FRONTEND.md §6](./CONVENTIONS-FRONTEND.md#6-openapi-ts-api-클라이언트)를 참조하세요.
 
 ---
 

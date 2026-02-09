@@ -1,6 +1,6 @@
 # Backend Reference Specifications
 
-> 이 문서는 Backend에서 사용하는 **참조 구현 코드(보일러플레이트)**를 모아둔 것입니다.
+> 이 문서는 Backend에서 사용하는 **참조 구현 코드**를 모아둔 것입니다.
 > 규칙과 컨벤션은 [CONVENTIONS-BACKEND.md](./CONVENTIONS-BACKEND.md)를 참조하세요.
 
 ---
@@ -185,44 +185,7 @@ class InternalServerException(AppException):
         super().__init__(500, "INTERNAL_ERROR", message, details)
 ```
 
-#### Exception Handlers (main.py)
-
-```python
-# main.py exception handlers
-from fastapi import Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-
-@app.exception_handler(AppException)
-async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
-    )
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    details = [
-        {"field": ".".join(str(loc) for loc in e["loc"][1:]), "message": e["msg"]}
-        for e in exc.errors()
-    ]
-    return JSONResponse(
-        status_code=422,
-        content={"error": {"code": "VALIDATION_ERROR", "message": "Request validation failed", "details": details}},
-    )
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    # 로깅 (스택트레이스는 서버 로그에만, 클라이언트에는 노출 금지)
-    import structlog
-    logger = structlog.get_logger()
-    logger.exception("unhandled_exception", exc_info=exc)
-    return JSONResponse(
-        status_code=500,
-        content={"error": {"code": "INTERNAL_ERROR", "message": "Internal server error", "details": None}},
-    )
-```
-
+Exception Handler 등록 코드는 [§1.11 main.py 전체 참조 구현](#111-mainpy-전체-참조-구현)을 참조하세요.
 예외 계층 및 에러 JSON 포맷은 [ARCHITECTURE.md §4.3](./ARCHITECTURE.md#43-에러-핸들링)을 참조하세요.
 
 ### 1.6 conftest.py Fixture
@@ -328,30 +291,7 @@ def _get_client_ip(request) -> str:
 limiter = Limiter(key_func=_get_client_ip)
 ```
 
-```python
-# main.py에 추가
-from fastapi import Request
-from fastapi.responses import JSONResponse
-from slowapi.errors import RateLimitExceeded
-
-from app.core.rate_limit import limiter
-
-app.state.limiter = limiter
-
-
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": {
-                "code": "RATE_LIMIT_EXCEEDED",
-                "message": "Too many requests. Please try again later.",
-                "details": None,
-            }
-        },
-    )
-```
+main.py 등록 코드는 [§1.11 main.py 전체 참조 구현](#111-mainpy-전체-참조-구현)을 참조하세요.
 
 ```python
 # api/v1/endpoints/auth.py에서 사용
@@ -438,14 +378,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 ```
 
-```python
-# main.py에 추가 (app 생성 직후)
-from app.core.logging import configure_logging
-from app.core.middleware import RequestIdMiddleware
-
-configure_logging()
-app.add_middleware(RequestIdMiddleware)
-```
+main.py 등록 코드는 [§1.11 main.py 전체 참조 구현](#111-mainpy-전체-참조-구현)을 참조하세요.
 
 ### 1.9 Health Check
 
@@ -695,7 +628,143 @@ async def change_password(
 - 도메인 예외(`ConflictException`, `NotFoundException`)를 발생시켜 Router에 전달
 - 트랜잭션 관리는 `get_db()` 컨텍스트에 위임 (Service에서 commit/rollback 호출 금지)
 
-### 2.2 AuthService 참조 구현
+### 2.2 AuthService
+
+auth_service 모듈의 전체 구현은 [§3.3 AuthService](#33-authservice)를 참조하세요.
+
+**핵심 요약:**
+- Refresh Token Rotation + Replay Detection (Lua 스크립트로 원자적 실행)
+- Token Family 패턴으로 탈취 조기 감지
+- Grace Period (10초) — 서버리스 환경 동시 요청 대응
+- 탈취 감지 시 해당 사용자의 모든 세션 무효화
+
+### 2.3 Redis 의존성
+
+```python
+# core/redis.py
+from collections.abc import AsyncGenerator
+
+from redis.asyncio import ConnectionPool, Redis
+
+from app.core.config import settings
+
+pool: ConnectionPool | None = None
+
+
+async def init_redis_pool() -> None:
+    """Redis 커넥션 풀 초기화. main.py lifespan startup에서 호출."""
+    global pool
+    pool = ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+async def close_redis_pool() -> None:
+    """Redis 커넥션 풀 종료. main.py lifespan shutdown에서 호출."""
+    global pool
+    if pool:
+        await pool.aclose()
+        pool = None
+
+
+async def get_redis() -> AsyncGenerator[Redis, None]:
+    """요청 스코프 Redis 클라이언트. ConnectionPool을 공유하여 매 요청마다 새 연결을 생성하지 않음."""
+    assert pool is not None, "Redis pool not initialized. Call init_redis_pool() first."
+    redis = Redis(connection_pool=pool)
+    try:
+        yield redis
+    finally:
+        await redis.aclose()
+```
+
+---
+
+## 3. Auth
+
+### 3.1 Auth 스키마
+
+```python
+# schemas/auth.py
+from pydantic import BaseModel, EmailStr
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+class TokenPayload(BaseModel):
+    sub: str          # user_id (UUID 문자열)
+    exp: int          # 만료 시각 (Unix timestamp)
+    iat: int          # 발급 시각 (Unix timestamp)
+    type: str         # "access"
+```
+
+### 3.2 Security 함수
+
+```python
+# core/security.py
+from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
+
+import jwt
+from passlib.context import CryptContext
+
+from app.core.config import settings
+from app.schemas.auth import TokenPayload
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+ALGORITHM = "HS256"
+
+
+def create_access_token(user_id: UUID) -> str:
+    """JWT access token 발급 (HS256, 15분 만료)"""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        "iat": now,
+        "type": "access",
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token() -> str:
+    """Refresh token 생성 (UUID v4)"""
+    return str(uuid4())
+
+
+def verify_access_token(token: str) -> TokenPayload:
+    """JWT 검증 → TokenPayload 반환 (dict 금지)"""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        token_data = TokenPayload(**payload)
+        if token_data.type != "access":
+            raise ValueError("Invalid token type")
+        return token_data
+    except (jwt.InvalidTokenError, ValueError) as e:
+        from app.core.exceptions import UnauthorizedException
+        raise UnauthorizedException(message="Invalid or expired token") from e
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """비밀번호 검증 (bcrypt)"""
+    return pwd_context.verify(plain, hashed)
+
+
+def hash_password(password: str) -> str:
+    """비밀번호 해싱 (bcrypt)"""
+    return pwd_context.hash(password)
+```
+
+### 3.3 AuthService
+
+Token Rotation, Replay Detection, Grace Period의 설계 전략은 [AUTH.md §4](./AUTH.md#4-refresh-token-rotation--replay-detection)를 참조하세요.
 
 ```python
 # services/auth_service.py
@@ -758,7 +827,6 @@ _REFRESH_GRACE_PERIOD_SECONDS = 10
 
 # Refresh Token Rotation Lua 스크립트 — 읽기→판단→쓰기를 하나의 원자적 작업으로 수행
 # KEYS[1] = refresh_token:{old_token}
-# KEYS[2] = token_family:{family_id}  (family_id는 호출 시점에 알 수 없으므로 스크립트 내부에서 조회)
 # ARGV[1] = old_token
 # ARGV[2] = new_token
 # ARGV[3] = new_refresh_token_key (refresh_token:{new_token})
@@ -862,81 +930,45 @@ async def _invalidate_all_sessions(redis: Redis, user_id: str) -> None:
         logger.warning("all_sessions_invalidated", user_id=user_id, session_count=count)
 ```
 
-**Refresh Token Rotation + Replay Detection:**
-- **Redis Key 구조:**
-  - `refresh_token:{token_value}` → value는 `{user_id}:{family_id}`
-  - `token_family:{family_id}` → value는 현재 유효한 token_value
-  - `user_families:{user_id}` → SET of family_id
-- **Replay 감지:** 이미 삭제된 토큰으로 refresh 시도 시 해당 사용자의 모든 세션 무효화
-- **TTL:** `REFRESH_TOKEN_EXPIRE_DAYS * 86400` 초
-
-### 2.3 Redis 의존성
+### 3.4 인증 의존성
 
 ```python
-# core/redis.py
-from collections.abc import AsyncGenerator
+# api/dependencies.py
+from uuid import UUID
 
-from redis.asyncio import ConnectionPool, Redis
+from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.database import get_db
+from app.core.exceptions import UnauthorizedException
+from app.core.security import verify_access_token
+from app.models.user import User
+from app.repositories.user_repository import user_repository
 
-pool: ConnectionPool | None = None
-
-
-async def init_redis_pool() -> None:
-    """Redis 커넥션 풀 초기화. main.py lifespan startup에서 호출."""
-    global pool
-    pool = ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True)
-
-
-async def close_redis_pool() -> None:
-    """Redis 커넥션 풀 종료. main.py lifespan shutdown에서 호출."""
-    global pool
-    if pool:
-        await pool.aclose()
-        pool = None
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
-async def get_redis() -> AsyncGenerator[Redis, None]:
-    """요청 스코프 Redis 클라이언트. ConnectionPool을 공유하여 매 요청마다 새 연결을 생성하지 않음."""
-    assert pool is not None, "Redis pool not initialized. Call init_redis_pool() first."
-    redis = Redis(connection_pool=pool)
+async def get_current_user(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(oauth2_scheme),
+) -> User:
+    """JWT 검증 → User 조회 → is_active 확인.
+    인증 의존성은 횡단 관심사이므로 Service 계층을 경유하지 않고
+    Repository를 직접 호출합니다 (CONVENTIONS-BACKEND §1 참조).
+    """
+    token_data = verify_access_token(token)
     try:
-        yield redis
-    finally:
-        await redis.aclose()
+        user_id = UUID(token_data.sub)
+    except ValueError as e:
+        raise UnauthorizedException(message="Invalid token payload") from e
+    user = await user_repository.get(db, id=user_id)
+    if user is None or not user.is_active:
+        raise UnauthorizedException(message="User not found or inactive")
+    return user
 ```
 
----
-
-## 3. Auth
-
-### 3.1 Auth 스키마
-
-```python
-# schemas/auth.py
-from pydantic import BaseModel, EmailStr
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-class TokenPayload(BaseModel):
-    sub: str          # user_id (UUID 문자열)
-    exp: int          # 만료 시각 (Unix timestamp)
-    iat: int          # 발급 시각 (Unix timestamp)
-    type: str         # "access"
-```
-
-### 3.2 Auth 엔드포인트
+### 3.5 Auth 엔드포인트
 
 ```python
 # api/v1/endpoints/auth.py
@@ -992,101 +1024,60 @@ async def logout(
     await auth_service.logout(redis, refresh_token=body.refresh_token)
 ```
 
-### 3.3 Security 함수 구현
+**인증 규칙:**
+- `OAuth2PasswordBearer` + `Depends`로 인증 주입
+- 인증 실패 시 401 `UNAUTHORIZED` 반환
+- 3-Layer 예외 규칙(인증 의존성의 Repository 직접 호출)은 [CONVENTIONS-BACKEND.md §1](./CONVENTIONS-BACKEND.md#1-3-layer-구조)을 참조
+- 토큰 구성 및 흐름은 [AUTH.md §1-5](./AUTH.md)를 참조
+
+### 3.6 Users Router 참조 구현
 
 ```python
-# core/security.py
-from datetime import datetime, timedelta, timezone
-from uuid import UUID, uuid4
-
-import jwt
-from passlib.context import CryptContext
-
-from app.core.config import settings
-from app.schemas.auth import TokenPayload
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-ALGORITHM = "HS256"
-
-
-def create_access_token(user_id: UUID) -> str:
-    """JWT access token 발급 (HS256, 15분 만료)"""
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user_id),
-        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-        "iat": now,
-        "type": "access",
-    }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
-
-
-def create_refresh_token() -> str:
-    """Refresh token 생성 (UUID v4)"""
-    return str(uuid4())
-
-
-def verify_access_token(token: str) -> TokenPayload:
-    """JWT 검증 → TokenPayload 반환 (dict 금지)"""
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
-        token_data = TokenPayload(**payload)
-        if token_data.type != "access":
-            raise ValueError("Invalid token type")
-        return token_data
-    except (jwt.InvalidTokenError, ValueError) as e:
-        from app.core.exceptions import UnauthorizedException
-        raise UnauthorizedException(message="Invalid or expired token") from e
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    """비밀번호 검증 (bcrypt)"""
-    return pwd_context.verify(plain, hashed)
-
-
-def hash_password(password: str) -> str:
-    """비밀번호 해싱 (bcrypt)"""
-    return pwd_context.hash(password)
-```
-
-### 3.4 인증 의존성
-
-```python
-# api/dependencies.py
+# api/v1/endpoints/users.py
 from uuid import UUID
 
-from fastapi import Depends
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.dependencies import get_current_user
 from app.core.database import get_db
-from app.core.exceptions import UnauthorizedException
-from app.core.security import verify_access_token
 from app.models.user import User
-from app.repositories.user_repository import user_repository
+from app.schemas.user import ChangePasswordRequest, UserResponse, UserUpdate
+from app.services import user_service
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+router = APIRouter(tags=["users"])
 
 
-async def get_current_user(
+@router.get("/me", response_model=UserResponse)
+async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
+    """현재 로그인한 사용자 정보 조회."""
+    return current_user
+
+
+@router.patch("/me", response_model=UserResponse)
+async def update_me(
+    body: UserUpdate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    token: str = Depends(oauth2_scheme),
-) -> User:
-    """JWT 검증 → User 조회 → is_active 확인.
-    인증 의존성은 횡단 관심사이므로 Service 계층을 경유하지 않고
-    Repository를 직접 호출합니다 (CONVENTIONS-BACKEND §1 참조).
-    """
-    token_data = verify_access_token(token)
-    try:
-        user_id = UUID(token_data.sub)
-    except ValueError as e:
-        raise UnauthorizedException(message="Invalid token payload") from e
-    user = await user_repository.get(db, id=user_id)
-    if user is None or not user.is_active:
-        raise UnauthorizedException(message="User not found or inactive")
-    return user
+) -> UserResponse:
+    """현재 사용자 정보 수정 (name 등)."""
+    return await user_service.update_user(db, user_id=current_user.id, obj_in=body)
+
+
+@router.post("/me/password", status_code=204)
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """비밀번호 변경. current_password 검증 후 new_password로 업데이트."""
+    await user_service.change_password(db, user_id=current_user.id, body=body)
 ```
+
+**핵심:**
+- 모든 엔드포인트는 `Depends(get_current_user)`로 인증 필수
+- Service 함수(`get_user`, `update_user`, `change_password`)는 [§2.1 UserService](./SPECS-BACKEND.md#21-userservice-참조-구현)를 참조
+- `GET /me`는 인증 의존성에서 이미 조회한 User 객체를 그대로 반환 (추가 DB 조회 없음)
 
 ---
 
@@ -1168,3 +1159,36 @@ class PaginatedResponse(BaseModel, Generic[T]):
     size: int
     pages: int
 ```
+
+---
+
+## 5. 로깅 참조
+
+> 로깅 규칙과 금지 사항은 [CONVENTIONS-BACKEND.md §10](./CONVENTIONS-BACKEND.md#10-로깅-전략)을 참조하세요.
+
+### 5.1 로그 포맷 예시
+
+```json
+{
+  "event": "login_success",
+  "level": "info",
+  "timestamp": "2024-01-15T10:30:45.123Z",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "request_id": "abc123",
+  "ip": "192.168.1.100"
+}
+```
+
+### 5.2 주요 로깅 지점
+
+| 이벤트 | 레벨 | 필수 필드 |
+|--------|------|----------|
+| 로그인 성공 | INFO | `user_id` |
+| 로그인 실패 | INFO | `email`, `reason` (invalid_credentials/inactive_account) |
+| 토큰 갱신 | INFO | `user_id` |
+| Replay 토큰 의심 | WARNING | `token_prefix` (앞 8자) |
+| Replay 토큰 확정 | WARNING | `user_id`, `family_id` |
+| 전체 세션 무효화 | WARNING | `user_id` |
+| Rate limit 초과 | WARNING | `ip`, `endpoint` |
+| API 요청 | INFO | `method`, `path`, `status_code`, `duration` |
+| 예외 발생 | ERROR | `exception`, `traceback` |

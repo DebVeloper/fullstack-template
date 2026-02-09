@@ -9,6 +9,16 @@
 
 ---
 
+## 설계 원칙
+
+모든 코드는 아래 원칙을 따릅니다:
+
+- **YAGNI** (You Aren't Gonna Need It): 현재 필요하지 않은 기능을 미리 구현하지 않는다
+- **KISS** (Keep It Simple, Stupid): 가장 단순한 해결책을 선택한다
+- **DRY** (Don't Repeat Yourself): 동일한 로직의 중복을 피한다. 단, 섣부른 추상화보다는 약간의 중복이 낫다
+
+---
+
 ## 1. 네이밍 규칙
 
 | 대상 | 규칙 | 예시 |
@@ -34,15 +44,13 @@
 ## 2. 코드 스타일
 
 **Frontend:**
-- ESLint: `next/core-web-vitals`, `next/typescript`
-- Prettier: `semi: true`, `singleQuote: false`, `tabWidth: 2`, `trailingComma: "all"`, `printWidth: 80`
-- TypeScript strict mode 필수
+- ESLint + Prettier + TypeScript strict mode 필수
 - 절대 경로 import (`@/` prefix)
+- 설정 파일: [SPECS-INFRA.md §6, §8](./SPECS-INFRA.md#6-frontend-설정) 참조
 
 **Backend:**
-- Ruff: `line-length = 88`, `target-version = "py312"`, `select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]`
-- mypy: `strict = true`, Pydantic plugin 활성화
-- pytest: `asyncio_mode = "auto"`
+- Ruff (lint + format) + mypy (strict) + pytest (asyncio)
+- 설정 파일: [SPECS-INFRA.md §7.1](./SPECS-INFRA.md#71-pyprojecttoml) 참조
 
 ---
 
@@ -111,21 +119,14 @@ develop → main (PR merge) → 태그 생성 → 배포
 
 ## 4. pre-commit Hooks
 
-커밋 전에 자동으로 lint, format, type-check를 실행합니다. 설정: `.pre-commit-config.yaml`
-
-| Hook | 대상 | 도구 |
-|------|------|------|
-| Frontend Lint | `*.ts`, `*.tsx` | `next lint` |
-| Frontend Type Check | `*.ts`, `*.tsx` | `tsc --noEmit` |
-| Frontend Format | `*.ts`, `*.tsx` | `prettier --check` |
-| Backend Lint + Fix | `backend/` | `ruff --fix` |
-| Backend Format | `backend/` | `ruff-format` |
-| Backend Type Check | `backend/` | `mypy --strict` |
+커밋 전에 자동으로 lint, format, type-check를 실행합니다.
 
 **규칙:**
 - 모든 개발자는 로컬에 pre-commit을 설치해야 합니다 (`pip install pre-commit && pre-commit install`)
 - CI에서는 개별 도구를 직접 실행하여 동일한 검증 수행
 - hook 실패 시 커밋 불가
+
+설정 파일: [SPECS-INFRA.md §5.1](./SPECS-INFRA.md#51-pre-commit-configyaml) 참조
 
 ---
 
