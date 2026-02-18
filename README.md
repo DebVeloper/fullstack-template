@@ -4,44 +4,56 @@
 
 **기술 스택:** Next.js 15 (App Router) + FastAPI + PostgreSQL + Redis
 
+이 템플릿은 **Google OAuth(OIDC) 로그인만**을 기본으로 합니다 (email/password 회원가입/로그인 기본 제공 없음).
+
 ---
 
 ## Quick Start
 
+### 1) Infra (PostgreSQL + Redis)
+
 ```bash
-# 1. 프로젝트 클론
-git clone https://github.com/debveloper/fullstack-template.git my-project
-cd my-project
-
-# 2. 환경변수 설정
-cp .env.example .env
-# .env 파일을 열어 SECRET_KEY 등 필수 값 설정
-
-# 3. 개발 환경 실행
-docker compose up -d
-
-# 4. DB 마이그레이션
-docker compose exec backend alembic upgrade head
-
-# 5. 접속 확인
-# Frontend: http://localhost:3000
-# Backend API 문서: http://localhost:8000/docs
-# PostgreSQL: localhost:5432
-# Redis: localhost:6379
+docker compose -f infra/docker-compose.yml up -d
 ```
+
+### 2) Backend (FastAPI, 로컬 실행)
+
+```bash
+cp backend/.env.example backend/.env
+# backend/.env에서 SECRET_KEY, ADMIN_EMAIL, GOOGLE_OAUTH_* 값을 설정하세요.
+
+cd backend
+uv sync
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 3) Frontend (Next.js, 로컬 실행)
+
+```bash
+cd frontend
+pnpm install
+cp .env.example .env.local
+pnpm dev
+```
+
+접속 확인:
+- Frontend: http://localhost:3000/login
+- Backend API 문서: http://localhost:8000/docs
+- PostgreSQL: localhost:5432
+- Redis: localhost:6379
 
 ## 주요 명령어
 
 | 명령어 | 설명 |
 |--------|------|
-| `docker compose up -d` | 전체 서비스 시작 |
-| `docker compose down` | 전체 서비스 중지 |
-| `docker compose logs -f backend` | Backend 로그 확인 |
-| `docker compose exec backend alembic revision --autogenerate -m "msg"` | DB 마이그레이션 생성 |
-| `docker compose exec backend pytest` | Backend 테스트 실행 |
-| `docker compose exec frontend npm test` | Frontend 테스트 실행 |
-| `docker compose exec frontend npx playwright test` | E2E 테스트 실행 |
-| `docker compose exec frontend npm run generate:api` | openapi-ts 타입 재생성 |
+| `docker compose -f infra/docker-compose.yml up -d` | DB/Redis 시작 |
+| `docker compose -f infra/docker-compose.yml down -v` | DB/Redis 중지 (볼륨 삭제) |
+| `cd backend && uv run alembic upgrade head` | DB 마이그레이션 적용 |
+| `cd backend && uv run pytest` | Backend 테스트 실행 |
+| `cd frontend && pnpm test` | Frontend 테스트 실행 (vitest, coverage 포함) |
+| `cd frontend && AUTH_TEST_MODE=true AUTH_TEST_SECRET=change-me pnpm test:e2e` | E2E 테스트 실행 (test-login 필요) |
+| `cd frontend && pnpm run generate:api` | openapi-ts 타입 재생성 (backend 실행 필요) |
 
 ## 문서 가이드
 
@@ -55,4 +67,4 @@ docker compose exec backend alembic upgrade head
 | [SPECS-BACKEND.md](./SPECS-BACKEND.md) | Backend 참조 구현 코드 |
 | [SPECS-FRONTEND.md](./SPECS-FRONTEND.md) | Frontend 참조 구현 코드 |
 | [SPECS-INFRA.md](./SPECS-INFRA.md) | Infrastructure 참조 구현 코드 (Docker, CI/CD, 설정 파일) |
-| [CLAUDE.md](./CLAUDE.md) | Claude Code 프로젝트 설정 및 AI 에이전트 규칙 |
+| [AGENTS.md](./AGENTS.md) | AI 에이전트 규칙 및 프로젝트 설정 |

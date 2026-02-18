@@ -15,24 +15,25 @@ src/app/
 │   ├── layout.tsx               # 인증 체크 레이아웃
 │   ├── dashboard/
 │   │   └── page.tsx
-│   └── settings/
-│       └── page.tsx
+│   └── admin/
+│       └── users/
+│           └── page.tsx
 ├── (public)/                    # 공개 라우트 그룹
-│   ├── layout.tsx
 │   ├── login/
 │   │   └── page.tsx
-│   └── register/
-│       └── page.tsx
 ├── api/                         # BFF API Routes
 │   ├── auth/                    # 인증 전용 BFF 라우트
-│   │   ├── login/
-│   │   │   └── route.ts         # 로그인 → 쿠키 설정
-│   │   ├── register/
-│   │   │   └── route.ts         # 회원가입 → 자동 로그인
+│   │   ├── google/
+│   │   │   ├── login/
+│   │   │   │   └── route.ts     # Google authorize redirect (state + PKCE)
+│   │   │   └── callback/
+│   │   │       └── route.ts     # code exchange → 쿠키 설정 → redirect
 │   │   ├── refresh/
 │   │   │   └── route.ts         # 토큰 갱신 → 쿠키 교체
 │   │   └── logout/
 │   │       └── route.ts         # 로그아웃 → 쿠키 삭제
+│   │   └── test-login/
+│   │       └── route.ts         # (E2E only) test login — AUTH_TEST_MODE=true일 때만
 │   └── [...path]/
 │       └── route.ts             # 범용 프록시
 ├── layout.tsx                   # 루트 레이아웃 (Providers) — 구현 코드는 SPECS-FRONTEND.md §1.10 참조
@@ -162,7 +163,7 @@ Backend의 OpenAPI 스펙에서 타입과 API 클라이언트를 자동 생성�
 - Backend 스키마 변경 시 반드시 재생성 (`npm run generate:api`)
 - 생성된 타입을 TanStack Query 커스텀 훅에서 import하여 사용
 - 수동 API 타입 정의 금지
-- Auth 요청(로그인, 회원가입, 토큰 갱신, 로그아웃)은 openapi-ts SDK를 사용하지 않고 BFF 전용 라우트(`/api/auth/*`)를 `fetch()`로 직접 호출 — SDK의 auth 함수는 BFF를 우회하여 쿠키가 설정되지 않음
+- Auth 요청(Google OAuth login/callback, 토큰 갱신, 로그아웃, test-login)은 openapi-ts SDK를 사용하지 않고 BFF 전용 라우트(`/api/auth/*`)를 직접 호출 — SDK는 일반 API(`/api/v1/*`)만 사용
 
 ---
 
@@ -204,10 +205,22 @@ export class LoginPage {
   constructor(private page: Page) {}
 
   async goto() { await this.page.goto("/login"); }
-  async login(email: string, password: string) {
-    await this.page.getByLabel("이메일").fill(email);
-    await this.page.getByLabel("비밀번호").fill(password);
-    await this.page.getByRole("button", { name: "로그인" }).click();
+}
+```
+
+Google OAuth는 E2E에서 실제 외부 로그인 대신 **test-login(BFF)** 으로 우회합니다:
+
+```typescript
+// e2e/helpers/test-login.ts
+import type { APIRequestContext } from "@playwright/test";
+
+export async function testLogin(request: APIRequestContext, email: string, name?: string) {
+  const response = await request.post("/api/auth/test-login", {
+    data: { email, name }
+  });
+
+  if (!response.ok()) {
+    throw new Error(`test-login failed: ${response.status()}`);
   }
 }
 ```

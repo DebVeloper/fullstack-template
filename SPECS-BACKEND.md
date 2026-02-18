@@ -115,19 +115,32 @@ class TimestampMixin:
 ```python
 # models/user.py
 import uuid
-from sqlalchemy import String, Boolean
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+
 from app.models.base import Base, TimestampMixin
 
 
 class User(Base, TimestampMixin):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    google_sub: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
-    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    picture_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 ```
 
 ### 1.5 Error Schemas + Exception Hierarchy
@@ -192,56 +205,82 @@ Exception Handler 등록 코드는 [§1.11 main.py 전체 참조 구현](#111-ma
 
 ```python
 # tests/conftest.py
+import os
+from collections.abc import AsyncGenerator
+
 import pytest
-from fakeredis.aioredis import FakeRedis
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.core.config import settings
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.redis import get_redis
 from app.main import app
 from app.models.base import Base
+from app.models.user import User  # noqa: F401
 
-TEST_DATABASE_URL = settings.DATABASE_URL.rsplit("/", 1)[0] + "/test"
 
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+class HealthyDBSession:
+    async def execute(self, _query: object) -> None:
+        return None
+
+
+class FakeRedis:
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        return None
 
 
 @pytest.fixture(scope="session")
-def anyio_backend():
+def anyio_backend() -> str:
     return "asyncio"
 
 
-@pytest.fixture(autouse=True)
-async def db_session():
+@pytest.fixture(scope="session")
+def test_database_url() -> str:
+    database_url_test = os.getenv("DATABASE_URL_TEST")
+    if database_url_test is not None:
+        return database_url_test
+
+    return get_settings().DATABASE_URL_TEST
+
+
+@pytest.fixture
+async def db_session(test_database_url: str) -> AsyncGenerator[AsyncSession, None]:
+    engine = create_async_engine(test_database_url)
+    test_session_factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    async with TestSessionLocal() as session:
+    async with test_session_factory() as session:
         yield session
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
-
-@pytest.fixture
-async def redis_session():
-    """FakeRedis 인스턴스. 실제 Redis 테스트가 필요한 경우 docker-compose의 테스트 Redis 인스턴스 사용."""
-    redis = FakeRedis(decode_responses=True)
-    try:
-        yield redis
-    finally:
-        await redis.aclose()
+    await engine.dispose()
 
 
 @pytest.fixture
-async def client(db_session: AsyncSession, redis_session: FakeRedis):
-    async def override_get_db():
-        yield db_session
+async def redis_session() -> AsyncGenerator[FakeRedis, None]:
+    redis = FakeRedis()
+    yield redis
+    await redis.aclose()
 
-    async def override_get_redis():
+
+@pytest.fixture
+async def client(redis_session: FakeRedis) -> AsyncGenerator[AsyncClient, None]:
+    async def override_get_db() -> AsyncGenerator[HealthyDBSession, None]:
+        yield HealthyDBSession()
+
+    async def override_get_redis() -> AsyncGenerator[FakeRedis, None]:
         yield redis_session
 
     app.dependency_overrides[get_db] = override_get_db
@@ -249,30 +288,9 @@ async def client(db_session: AsyncSession, redis_session: FakeRedis):
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
-    ) as ac:
-        yield ac
+    ) as async_client:
+        yield async_client
     app.dependency_overrides.clear()
-
-
-@pytest.fixture
-async def authenticated_client(client: AsyncClient, db_session: AsyncSession):
-    """로그인된 클라이언트. 테스트 사용자 생성 후 인증 헤더 설정."""
-    from app.core.security import hash_password, create_access_token
-    from app.models.user import User
-
-    user = User(
-        email="test@example.com",
-        name="Test User",
-        hashed_password=hash_password("testpassword123"),
-        is_active=True,
-    )
-    db_session.add(user)
-    await db_session.flush()
-    await db_session.refresh(user)
-
-    access_token = create_access_token(user.id)
-    client.headers["Authorization"] = f"Bearer {access_token}"
-    yield client
 ```
 
 ### 1.7 Rate Limiting
@@ -551,81 +569,77 @@ app.include_router(api_router, prefix="/api/v1")
 # api/v1/router.py
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import auth, health, users
+from app.api.v1.endpoints import admin_users, auth, health, users
 
 api_router = APIRouter()
 api_router.include_router(health.router)
-api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
-api_router.include_router(users.router, prefix="/users", tags=["users"])
+api_router.include_router(auth.router, prefix="/auth")
+api_router.include_router(users.router, prefix="/users")
+api_router.include_router(admin_users.router, prefix="/admin/users")
 ```
 
 ---
 
 ## 2. Service 계층
 
-### 2.1 UserService 참조 구현
+### 2.1 AdminUserService 참조 구현
 
 ```python
-# services/user_service.py
+# services/admin_user_service.py
+from datetime import UTC, datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ConflictException, NotFoundException, UnauthorizedException
-from app.core.security import hash_password, verify_password
+from app.core.exceptions import AppException, NotFoundException
 from app.models.user import User
 from app.repositories.user_repository import user_repository
-from app.schemas.user import ChangePasswordRequest, UserCreate, UserUpdate
+from app.services import auth_service
+
+SUPERADMIN_PROTECTED_CODE = "SUPERADMIN_PROTECTED"
+SUPERADMIN_PROTECTED_MESSAGE = "Superadmin account cannot be modified"
 
 
-class UserCreateInternal(BaseModel):
-    """password 대신 hashed_password를 포함하는 내부 스키마.
-    UserCreate → UserCreateInternal 변환 후 Repository에 전달."""
-    email: str
-    name: str
-    hashed_password: str
+def normalize_email(email: str) -> str:
+    return email.strip().casefold()
 
 
-async def create_user(db: AsyncSession, *, obj_in: UserCreate) -> User:
-    existing = await user_repository.get_by_email(db, email=obj_in.email)
-    if existing:
-        raise ConflictException(message="Email already registered")
-    internal = UserCreateInternal(
-        email=obj_in.email,
-        name=obj_in.name,
-        hashed_password=hash_password(obj_in.password),
-    )
-    return await user_repository.create(db, obj_in=internal)
+def is_superadmin_email(*, user_email: str, admin_email: str) -> bool:
+    return normalize_email(user_email) == normalize_email(admin_email)
 
 
-async def get_user(db: AsyncSession, *, user_id: UUID) -> User:
-    user = await user_repository.get(db, id=user_id)
+def _ensure_not_superadmin(*, target_user: User, admin_email: str) -> None:
+    if is_superadmin_email(user_email=target_user.email, admin_email=admin_email):
+        raise AppException(
+            status_code=403,
+            code=SUPERADMIN_PROTECTED_CODE,
+            message=SUPERADMIN_PROTECTED_MESSAGE,
+        )
+
+
+async def lock_user(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    user_id: UUID,
+    admin_email: str,
+) -> User:
+    user = await user_repository.get_by_id(db, user_id=user_id)
     if user is None:
         raise NotFoundException(message="User not found")
-    return user
 
+    _ensure_not_superadmin(target_user=user, admin_email=admin_email)
 
-async def update_user(db: AsyncSession, *, user_id: UUID, obj_in: UserUpdate) -> User:
-    user = await get_user(db, user_id=user_id)
-    return await user_repository.update(db, db_obj=user, obj_in=obj_in)
-
-
-async def change_password(
-    db: AsyncSession, *, user_id: UUID, body: ChangePasswordRequest
-) -> None:
-    """비밀번호 변경. current_password 검증 후 new_password로 업데이트."""
-    user = await get_user(db, user_id=user_id)
-    if not verify_password(body.current_password, user.hashed_password):
-        raise UnauthorizedException(message="Current password is incorrect")
-    user.hashed_password = hash_password(body.new_password)
-    await db.flush()
-    await db.refresh(user)
+    updated_user = await user_repository.set_active_status(db, user=user, is_active=False)
+    await auth_service.revoke_all_sessions(redis, user_id=str(updated_user.id))
+    return updated_user
 ```
 
 **핵심 원칙:**
 - Repository를 조합하여 비즈니스 로직 처리
-- 도메인 예외(`ConflictException`, `NotFoundException`)를 발생시켜 Router에 전달
+- 도메인 예외(`NotFoundException`, `AppException`)를 발생시켜 Router에 전달
+- 계정 상태 변경(lock/delete) 시 세션 패밀리 revoke로 refresh를 즉시 차단
 - 트랜잭션 관리는 `get_db()` 컨텍스트에 위임 (Service에서 commit/rollback 호출 금지)
 
 ### 2.2 AuthService
@@ -683,83 +697,78 @@ async def get_redis() -> AsyncGenerator[Redis, None]:
 
 ```python
 # schemas/auth.py
-from pydantic import BaseModel, EmailStr
+from typing import Literal
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+from pydantic import BaseModel
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class GoogleExchangeRequest(BaseModel):
+    code: str
+    code_verifier: str
+
+
+class TestLoginRequest(BaseModel):
+    email: str
+    name: str | None = None
 
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
-    token_type: str = "bearer"
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
 
 class TokenPayload(BaseModel):
     sub: str          # user_id (UUID 문자열)
     exp: int          # 만료 시각 (Unix timestamp)
     iat: int          # 발급 시각 (Unix timestamp)
-    type: str         # "access"
+    type: Literal["access"]
 ```
 
 ### 3.2 Security 함수
 
 ```python
 # core/security.py
-from datetime import datetime, timedelta, timezone
-from uuid import UUID, uuid4
+import os
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import jwt
-from passlib.context import CryptContext
+from pydantic import ValidationError
 
-from app.core.config import settings
+from app.core.exceptions import UnauthorizedException
 from app.schemas.auth import TokenPayload
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+
+
+def _get_secret_key() -> str:
+    secret_key = os.getenv("SECRET_KEY")
+    if not secret_key:
+        raise RuntimeError("SECRET_KEY environment variable is required")
+    return secret_key
 
 
 def create_access_token(user_id: UUID) -> str:
-    """JWT access token 발급 (HS256, 15분 만료)"""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload = {
         "sub": str(user_id),
-        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-        "iat": now,
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
+        "iat": int(now.timestamp()),
         "type": "access",
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
-
-
-def create_refresh_token() -> str:
-    """Refresh token 생성 (UUID v4)"""
-    return str(uuid4())
+    return jwt.encode(payload, _get_secret_key(), algorithm=ALGORITHM)
 
 
 def verify_access_token(token: str) -> TokenPayload:
-    """JWT 검증 → TokenPayload 반환 (dict 금지)"""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
-        token_data = TokenPayload(**payload)
-        if token_data.type != "access":
-            raise ValueError("Invalid token type")
-        return token_data
-    except (jwt.InvalidTokenError, ValueError) as e:
-        from app.core.exceptions import UnauthorizedException
-        raise UnauthorizedException(message="Invalid or expired token") from e
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    """비밀번호 검증 (bcrypt)"""
-    return pwd_context.verify(plain, hashed)
-
-
-def hash_password(password: str) -> str:
-    """비밀번호 해싱 (bcrypt)"""
-    return pwd_context.hash(password)
+        payload = jwt.decode(token, _get_secret_key(), algorithms=[ALGORITHM])
+        return TokenPayload.model_validate(payload)
+    except (jwt.InvalidTokenError, ValidationError, RuntimeError) as exc:
+        raise UnauthorizedException(message="Invalid or expired token") from exc
 ```
 
 ### 3.3 AuthService
@@ -768,180 +777,367 @@ Token Rotation, Replay Detection, Grace Period의 설계 전략은 [AUTH.md §4]
 
 ```python
 # services/auth_service.py
-import structlog
+from inspect import isawaitable
+from typing import Any, cast
 from uuid import UUID, uuid4
+
+import structlog
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import UnauthorizedException
-from app.core.security import (
-    create_access_token,
-    create_refresh_token,
-    verify_password,
-)
+from app.core.security import create_access_token
+from app.models.user import User
 from app.repositories.user_repository import user_repository
-from app.schemas.auth import LoginRequest, TokenResponse
+from app.schemas.auth import TokenResponse
+from app.services import google_oauth_service
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 REFRESH_TOKEN_PREFIX = "refresh_token:"
 TOKEN_FAMILY_PREFIX = "token_family:"
 USER_FAMILIES_PREFIX = "user_families:"
+REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+REFRESH_TOKEN_GRACE_PERIOD_SECONDS = 10
+ROTATION_STATUS_EXPIRED = "EXPIRED"
+ROTATION_STATUS_GRACE = "GRACE:"
+ROTATION_STATUS_REPLAY = "REPLAY:"
+ROTATION_STATUS_ROTATED = "ROTATED:"
 
-
-async def login(
-    db: AsyncSession, redis: Redis, *, body: LoginRequest
-) -> TokenResponse:
-    """이메일/비밀번호 인증 → 토큰 발급 + Redis 저장."""
-    user = await user_repository.get_by_email(db, email=body.email)
-    if user is None or not verify_password(body.password, user.hashed_password):
-        logger.info("login_failed", email=body.email, reason="invalid_credentials")
-        raise UnauthorizedException(message="Invalid email or password")
-    if not user.is_active:
-        logger.info("login_failed", email=body.email, reason="inactive_account")
-        raise UnauthorizedException(message="User account is inactive")
-
-    access_token = create_access_token(user.id)
-    refresh_token = create_refresh_token()
-    family_id = str(uuid4())
-    ttl = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
-
-    pipe = redis.pipeline()
-    pipe.set(
-        f"{REFRESH_TOKEN_PREFIX}{refresh_token}",
-        f"{user.id}:{family_id}",
-        ex=ttl,
-    )
-    pipe.set(f"{TOKEN_FAMILY_PREFIX}{family_id}", refresh_token, ex=ttl)
-    pipe.sadd(f"{USER_FAMILIES_PREFIX}{user.id}", family_id)
-    await pipe.execute()
-
-    logger.info("login_success", user_id=str(user.id))
-    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
-
-
-# 서버리스 환경에서 동시에 여러 인스턴스가 같은 refresh_token으로 요청할 수 있으므로,
-# rotation된 구 토큰에 짧은 유예기간(grace period)을 둡니다.
-_REFRESH_GRACE_PERIOD_SECONDS = 10
-
-# Refresh Token Rotation Lua 스크립트 — 읽기→판단→쓰기를 하나의 원자적 작업으로 수행
-# KEYS[1] = refresh_token:{old_token}
-# ARGV[1] = old_token
-# ARGV[2] = new_token
-# ARGV[3] = new_refresh_token_key (refresh_token:{new_token})
-# ARGV[4] = ttl (seconds)
-# ARGV[5] = grace_period (seconds)
-# 반환: "OK:{user_id}:{family_id}" | "EXPIRED" | "REPLAY:{user_id}"
-_REFRESH_ROTATION_SCRIPT = """
-local stored = redis.call('GET', KEYS[1])
-if not stored then
+_REFRESH_ROTATION_LUA = """
+local mapping = redis.call('GET', KEYS[1])
+if not mapping then
     return 'EXPIRED'
 end
 
-local sep = stored:find(':[^:]*$')
-local user_id = stored:sub(1, sep - 1)
-local family_id = stored:sub(sep + 1)
-local family_key = 'token_family:' .. family_id
+local sep = mapping:find(':[^:]*$')
+if not sep then
+    redis.call('DEL', KEYS[1])
+    return 'EXPIRED'
+end
 
+local user_id = mapping:sub(1, sep - 1)
+local family_id = mapping:sub(sep + 1)
+if user_id == '' or family_id == '' then
+    redis.call('DEL', KEYS[1])
+    return 'EXPIRED'
+end
+
+local family_key = 'token_family:' .. family_id
 local current_token = redis.call('GET', family_key)
+if not current_token then
+    redis.call('DEL', KEYS[1])
+    return 'EXPIRED'
+end
+
 if current_token ~= ARGV[1] then
+    local ttl = redis.call('TTL', KEYS[1])
+    if ttl > 0 and ttl <= tonumber(ARGV[3]) then
+        return 'GRACE:' .. current_token
+    end
     return 'REPLAY:' .. user_id
 end
 
--- Rotation: 구 토큰에 grace period TTL 설정, 신규 토큰 저장
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
-redis.call('SET', ARGV[3], user_id .. ':' .. family_id, 'EX', tonumber(ARGV[4]))
-redis.call('SET', family_key, ARGV[2], 'EX', tonumber(ARGV[4]))
+redis.call('SET', ARGV[2], mapping, 'EX', tonumber(ARGV[4]))
+redis.call('SET', family_key, ARGV[5], 'EX', tonumber(ARGV[4]))
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
 
-return 'OK:' .. user_id .. ':' .. family_id
+return 'ROTATED:' .. ARGV[5]
 """
 
 
-async def refresh(redis: Redis, *, refresh_token: str) -> TokenResponse:
-    """Refresh Token Rotation + Replay 감지.
-    Lua 스크립트로 원자적 실행하여 race condition 방지."""
-    new_refresh_token = create_refresh_token()
-    ttl = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+def _refresh_token_key(token: str) -> str:
+    return f"{REFRESH_TOKEN_PREFIX}{token}"
 
-    rotation_script = redis.register_script(_REFRESH_ROTATION_SCRIPT)
-    result: str = await rotation_script(
-        keys=[f"{REFRESH_TOKEN_PREFIX}{refresh_token}"],
-        args=[
-            refresh_token,
-            new_refresh_token,
-            f"{REFRESH_TOKEN_PREFIX}{new_refresh_token}",
-            ttl,
-            _REFRESH_GRACE_PERIOD_SECONDS,
-        ],
-    )
 
-    if result == "EXPIRED":
-        logger.warning("token_replay_suspected", token_prefix=refresh_token[:8])
+def _token_family_key(family_id: str) -> str:
+    return f"{TOKEN_FAMILY_PREFIX}{family_id}"
+
+
+def _user_families_key(user_id: str) -> str:
+    return f"{USER_FAMILIES_PREFIX}{user_id}"
+
+
+async def _resolve_redis_result(value: Any) -> Any:
+    if isawaitable(value):
+        return await value
+    return value
+
+
+def _execute_redis_command(redis: Redis, *args: object) -> Any:
+    redis_client: Any = redis
+    return redis_client.execute_command(*args)
+
+
+def _parse_refresh_mapping(mapping: str) -> tuple[str, str]:
+    parts = mapping.rsplit(":", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise UnauthorizedException(message="Invalid or expired refresh token")
+    return parts[0], parts[1]
+
+
+async def refresh(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    refresh_token: str,
+) -> TokenResponse:
+    refresh_key = _refresh_token_key(refresh_token)
+    stored_mapping = await redis.get(refresh_key)
+    if stored_mapping is None:
         raise UnauthorizedException(message="Invalid or expired refresh token")
 
-    if result.startswith("REPLAY:"):
-        user_id_str = result.split(":", 1)[1]
-        logger.warning("token_replay_detected", user_id=user_id_str)
+    user_id_str, family_id = _parse_refresh_mapping(stored_mapping)
+
+    try:
+        user_id = UUID(user_id_str)
+    except ValueError as exc:
+        await redis.delete(refresh_key)
+        raise UnauthorizedException(message="Invalid or expired refresh token") from exc
+
+    user = await user_repository.get_by_id(db, user_id=user_id)
+    if user is None or not user.is_active or user.deleted_at is not None:
+        await redis.delete(refresh_key)
         await _invalidate_all_sessions(redis, user_id_str)
+        logger.warning("refresh_denied_user_inactive", user_id=user_id_str)
+        raise UnauthorizedException(message="User not found or inactive")
+
+    new_refresh_token = str(uuid4())
+    result_raw = await _resolve_redis_result(
+        _execute_redis_command(
+            redis,
+            "EVAL",
+            _REFRESH_ROTATION_LUA,
+            1,
+            refresh_key,
+            refresh_token,
+            _refresh_token_key(new_refresh_token),
+            REFRESH_TOKEN_GRACE_PERIOD_SECONDS,
+            REFRESH_TOKEN_TTL_SECONDS,
+            new_refresh_token,
+        )
+    )
+
+    if result_raw is None:
+        raise UnauthorizedException(message="Invalid or expired refresh token")
+    if isinstance(result_raw, bytes):
+        result = result_raw.decode("utf-8")
+    elif isinstance(result_raw, str):
+        result = result_raw
+    else:
+        result = str(result_raw)
+
+    if result == ROTATION_STATUS_EXPIRED:
+        raise UnauthorizedException(message="Invalid or expired refresh token")
+
+    if result.startswith(ROTATION_STATUS_GRACE):
+        current_family_token = result.split(":", 1)[1]
+        logger.info(
+            "refresh_grace_period_reuse",
+            user_id=user_id_str,
+            family_id=family_id,
+        )
+        return TokenResponse(
+            access_token=create_access_token(user_id),
+            refresh_token=current_family_token,
+        )
+
+    if result.startswith(ROTATION_STATUS_REPLAY):
+        replay_user_id = result.split(":", 1)[1]
+        await redis.delete(refresh_key)
+        await _invalidate_all_sessions(redis, replay_user_id)
+        logger.warning("refresh_replay_detected", user_id=replay_user_id)
         raise UnauthorizedException(message="Token reuse detected. All sessions revoked.")
 
-    # result == "OK:{user_id}:{family_id}"
-    _, user_id_str, _family_id = result.split(":", 2)
-    user_id = UUID(user_id_str)
-    new_access_token = create_access_token(user_id)
+    if not result.startswith(ROTATION_STATUS_ROTATED):
+        raise UnauthorizedException(message="Invalid or expired refresh token")
 
-    logger.info("token_refreshed", user_id=user_id_str)
-    return TokenResponse(access_token=new_access_token, refresh_token=new_refresh_token)
+    rotated_refresh_token = result.split(":", 1)[1]
+
+    logger.info("refresh_rotated", user_id=user_id_str, family_id=family_id)
+    return TokenResponse(
+        access_token=create_access_token(user_id),
+        refresh_token=rotated_refresh_token,
+    )
+
+
+async def exchange_google_code_for_tokens(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    code: str,
+    code_verifier: str,
+) -> TokenResponse:
+    token_payload = await google_oauth_service.exchange_code_for_tokens(
+        code=code,
+        code_verifier=code_verifier,
+    )
+    id_token_claims = await google_oauth_service.verify_id_token(token_payload["id_token"])
+
+    if not id_token_claims["email_verified"]:
+        raise UnauthorizedException(message="Google account email is not verified")
+
+    existing_user = await user_repository.get_by_google_sub(
+        db,
+        google_sub=id_token_claims["sub"],
+    )
+    if existing_user is not None and (
+        not existing_user.is_active or existing_user.deleted_at is not None
+    ):
+        raise UnauthorizedException(message="User not found or inactive")
+
+    user = await user_repository.upsert_google_user(
+        db,
+        google_sub=id_token_claims["sub"],
+        email=id_token_claims["email"],
+        name=id_token_claims["name"] or id_token_claims["email"],
+        picture_url=id_token_claims["picture"],
+    )
+
+    return await issue_refresh_token_pair(redis, user_id=user.id)
+
+
+async def test_login(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    email: str,
+    name: str | None,
+) -> TokenResponse:
+    user = await user_repository.get_by_email(db, email)
+
+    if user is None:
+        user = User(
+            google_sub=f"test-login-{uuid4()}",
+            email=email,
+            name=name or email,
+            picture_url=None,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        await db.refresh(user)
+
+    if not user.is_active or user.deleted_at is not None:
+        raise UnauthorizedException(message="User not found or inactive")
+
+    if name and user.name != name:
+        user.name = name
+        await db.flush()
+
+    return await issue_refresh_token_pair(redis, user_id=user.id)
 
 
 async def logout(redis: Redis, *, refresh_token: str) -> None:
-    """Redis에서 Refresh Token + Family 삭제."""
-    stored = await redis.get(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
-    if stored:
-        user_id_str, family_id = stored.rsplit(":", 1)
-        pipe = redis.pipeline()
-        pipe.delete(f"{REFRESH_TOKEN_PREFIX}{refresh_token}")
-        pipe.delete(f"{TOKEN_FAMILY_PREFIX}{family_id}")
-        pipe.srem(f"{USER_FAMILIES_PREFIX}{user_id_str}", family_id)
-        await pipe.execute()
-        logger.info("logout_success", user_id=user_id_str)
+    refresh_key = _refresh_token_key(refresh_token)
+    stored_mapping = await redis.get(refresh_key)
+    if stored_mapping is None:
+        return
+
+    try:
+        user_id_str, family_id = _parse_refresh_mapping(stored_mapping)
+    except UnauthorizedException:
+        await redis.delete(refresh_key)
+        return
+
+    family_key = _token_family_key(family_id)
+    current_family_token = await redis.get(family_key)
+
+    pipe = redis.pipeline()
+    pipe.delete(refresh_key)
+    if current_family_token is not None:
+        pipe.delete(_refresh_token_key(current_family_token))
+    pipe.delete(family_key)
+    pipe.srem(_user_families_key(user_id_str), family_id)
+    await pipe.execute()
+
+    logger.info("logout_success", user_id=user_id_str, family_id=family_id)
 
 
-_INVALIDATE_ALL_SESSIONS_SCRIPT = """
-local family_ids = redis.call('SMEMBERS', KEYS[1])
-for _, fid in ipairs(family_ids) do
-    local token = redis.call('GET', 'token_family:' .. fid)
-    if token then
-        redis.call('DEL', 'refresh_token:' .. token)
-    end
-    redis.call('DEL', 'token_family:' .. fid)
-end
-redis.call('DEL', KEYS[1])
-return #family_ids
-"""
+async def issue_refresh_token_pair(
+    redis: Redis,
+    *,
+    user_id: UUID,
+) -> TokenResponse:
+    refresh_token = str(uuid4())
+    family_id = str(uuid4())
+    user_id_str = str(user_id)
+
+    pipe = redis.pipeline()
+    pipe.set(
+        _refresh_token_key(refresh_token),
+        f"{user_id_str}:{family_id}",
+        ex=REFRESH_TOKEN_TTL_SECONDS,
+    )
+    pipe.set(
+        _token_family_key(family_id),
+        refresh_token,
+        ex=REFRESH_TOKEN_TTL_SECONDS,
+    )
+    pipe.sadd(_user_families_key(user_id_str), family_id)
+    await pipe.execute()
+
+    return TokenResponse(
+        access_token=create_access_token(user_id),
+        refresh_token=refresh_token,
+    )
+
+
+async def revoke_all_sessions(redis: Redis, *, user_id: str) -> None:
+    await _invalidate_all_sessions(redis, user_id)
 
 
 async def _invalidate_all_sessions(redis: Redis, user_id: str) -> None:
-    """탈취 감지 시 해당 사용자의 모든 세션 무효화. Lua 스크립트로 원자적 실행."""
-    invalidate_script = redis.register_script(_INVALIDATE_ALL_SESSIONS_SCRIPT)
-    count = await invalidate_script(keys=[f"{USER_FAMILIES_PREFIX}{user_id}"])
-    if count:
-        logger.warning("all_sessions_invalidated", user_id=user_id, session_count=count)
+    family_ids_result = await _resolve_redis_result(
+        _execute_redis_command(
+            redis,
+            "SMEMBERS",
+            _user_families_key(user_id),
+        )
+    )
+    if isinstance(family_ids_result, set):
+        family_ids = cast(set[str], family_ids_result)
+    elif isinstance(family_ids_result, (list, tuple)):
+        family_ids = {str(item) for item in family_ids_result}
+    elif family_ids_result is None:
+        family_ids = set()
+    else:
+        family_ids = {str(cast(Any, family_ids_result))}
+
+    pipe = redis.pipeline()
+    for family_id in family_ids:
+        family_key = _token_family_key(family_id)
+        current_token = await redis.get(family_key)
+        if current_token is not None:
+            pipe.delete(_refresh_token_key(current_token))
+        pipe.delete(family_key)
+
+    pipe.delete(_user_families_key(user_id))
+    await pipe.execute()
+
+    if family_ids:
+        logger.warning(
+            "refresh_sessions_invalidated",
+            user_id=user_id,
+            session_count=len(family_ids),
+        )
 ```
 
 ### 3.4 인증 의존성
 
 ```python
 # api/dependencies.py
+from dataclasses import dataclass
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.exceptions import UnauthorizedException
+from app.core.exceptions import ForbiddenException, UnauthorizedException
 from app.core.security import verify_access_token
 from app.models.user import User
 from app.repositories.user_repository import user_repository
@@ -949,79 +1145,132 @@ from app.repositories.user_repository import user_repository
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
+def normalize_email(email: str) -> str:
+    return email.strip().casefold()
+
+
+def is_admin_email(*, user_email: str, admin_email: str) -> bool:
+    return normalize_email(user_email) == normalize_email(admin_email)
+
+
+@dataclass(slots=True)
+class AdminPrincipal:
+    user: User
+    admin_email: str
+
+
 async def get_current_user(
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(oauth2_scheme),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    token: Annotated[str, Depends(oauth2_scheme)],
 ) -> User:
-    """JWT 검증 → User 조회 → is_active 확인.
-    인증 의존성은 횡단 관심사이므로 Service 계층을 경유하지 않고
-    Repository를 직접 호출합니다 (CONVENTIONS-BACKEND §1 참조).
-    """
-    token_data = verify_access_token(token)
+    token_payload = verify_access_token(token)
+
     try:
-        user_id = UUID(token_data.sub)
-    except ValueError as e:
-        raise UnauthorizedException(message="Invalid token payload") from e
-    user = await user_repository.get(db, id=user_id)
-    if user is None or not user.is_active:
+        user_id = UUID(token_payload.sub)
+    except ValueError as exc:
+        raise UnauthorizedException(message="Invalid token payload") from exc
+
+    user = await user_repository.get_by_id(db, user_id=user_id)
+    if user is None or not user.is_active or user.deleted_at is not None:
         raise UnauthorizedException(message="User not found or inactive")
+
     return user
+
+
+async def require_admin(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> AdminPrincipal:
+    admin_email = get_settings().ADMIN_EMAIL
+    if not is_admin_email(user_email=current_user.email, admin_email=admin_email):
+        raise ForbiddenException(message="Admin access required")
+
+    return AdminPrincipal(user=current_user, admin_email=admin_email)
 ```
 
 ### 3.5 Auth 엔드포인트
 
 ```python
 # api/v1/endpoints/auth.py
-from fastapi import APIRouter, Depends, status
+from secrets import compare_digest
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, Response, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.exceptions import NotFoundException, UnauthorizedException
 from app.core.redis import get_redis
-from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
-from app.schemas.user import UserCreate, UserResponse
+from app.schemas.auth import (
+    GoogleExchangeRequest,
+    RefreshRequest,
+    TestLoginRequest,
+    TokenResponse,
+)
 from app.services import auth_service
 
 router = APIRouter(tags=["auth"])
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(
-    body: UserCreate,
-    db: AsyncSession = Depends(get_db),
-) -> UserResponse:
-    """회원가입 → 사용자 생성.
-    회원가입 후 자동 로그인은 BFF 라우트에서 처리합니다. Backend는 사용자 생성만 담당."""
-    from app.services import user_service
-    user = await user_service.create_user(db, obj_in=body)
-    return user
-
-
-@router.post("/login", response_model=TokenResponse)
-async def login(
-    body: LoginRequest,
-    db: AsyncSession = Depends(get_db),
-    redis: Redis = Depends(get_redis),
-) -> TokenResponse:
-    """이메일/비밀번호 인증 → access_token + refresh_token JSON 반환.
-    BFF가 쿠키를 설정한다 (Backend는 Set-Cookie 사용 안 함)."""
-    return await auth_service.login(db, redis, body=body)
-
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(
+async def refresh_tokens(
     body: RefreshRequest,
-    redis: Redis = Depends(get_redis),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> TokenResponse:
-    """refresh_token을 body로 수신 → 검증 → Rotation(기존 삭제 + 신규 발급)."""
-    return await auth_service.refresh(redis, refresh_token=body.refresh_token)
+    return await auth_service.refresh(db, redis, refresh_token=body.refresh_token)
+
+
+@router.post("/google/exchange", response_model=TokenResponse)
+async def exchange_google_code(
+    body: GoogleExchangeRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> TokenResponse:
+    return await auth_service.exchange_google_code_for_tokens(
+        db,
+        redis,
+        code=body.code,
+        code_verifier=body.code_verifier,
+    )
+
+
+@router.post("/test-login", response_model=TokenResponse, include_in_schema=False)
+async def test_login(
+    body: TestLoginRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(get_redis)],
+    x_test_auth_secret: Annotated[str | None, Header()] = None,
+) -> TokenResponse:
+    settings = get_settings()
+
+    if not settings.AUTH_TEST_MODE:
+        raise NotFoundException()
+
+    configured_secret = settings.AUTH_TEST_SECRET
+    if (
+        configured_secret is None
+        or x_test_auth_secret is None
+        or not compare_digest(x_test_auth_secret, configured_secret)
+    ):
+        raise UnauthorizedException(message="Invalid test auth secret")
+
+    return await auth_service.test_login(
+        db,
+        redis,
+        email=str(body.email),
+        name=body.name,
+    )
+
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     body: RefreshRequest,
-    redis: Redis = Depends(get_redis),
-) -> None:
-    """refresh_token을 body로 수신 → Redis에서 삭제 → 204 No Content."""
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> Response:
     await auth_service.logout(redis, refresh_token=body.refresh_token)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 ```
 
 **인증 규칙:**
@@ -1034,126 +1283,92 @@ async def logout(
 
 ```python
 # api/v1/endpoints/users.py
-from uuid import UUID
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user
-from app.core.database import get_db
+from app.core.config import get_settings
 from app.models.user import User
-from app.schemas.user import ChangePasswordRequest, UserResponse, UserUpdate
-from app.services import user_service
+from app.schemas.user import UserMeResponse
 
 router = APIRouter(tags=["users"])
 
 
-@router.get("/me", response_model=UserResponse)
-async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
-    """현재 로그인한 사용자 정보 조회."""
-    return current_user
+def normalize_email(email: str) -> str:
+    return email.strip().casefold()
 
 
-@router.patch("/me", response_model=UserResponse)
-async def update_me(
-    body: UserUpdate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> UserResponse:
-    """현재 사용자 정보 수정 (name 등)."""
-    return await user_service.update_user(db, user_id=current_user.id, obj_in=body)
+def is_admin_email(*, user_email: str, admin_email: str) -> bool:
+    return normalize_email(user_email) == normalize_email(admin_email)
 
 
-@router.post("/me/password", status_code=204)
-async def change_password(
-    body: ChangePasswordRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    """비밀번호 변경. current_password 검증 후 new_password로 업데이트."""
-    await user_service.change_password(db, user_id=current_user.id, body=body)
+@router.get("/me", response_model=UserMeResponse)
+async def get_me(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> UserMeResponse:
+    is_admin = is_admin_email(
+        user_email=current_user.email,
+        admin_email=get_settings().ADMIN_EMAIL,
+    )
+    return UserMeResponse(
+        id=current_user.id,
+        email=current_user.email,
+        name=current_user.name,
+        picture_url=current_user.picture_url,
+        is_active=current_user.is_active,
+        created_at=current_user.created_at,
+        updated_at=current_user.updated_at,
+        is_admin=is_admin,
+    )
 ```
 
 **핵심:**
 - 모든 엔드포인트는 `Depends(get_current_user)`로 인증 필수
-- Service 함수(`get_user`, `update_user`, `change_password`)는 [§2.1 UserService](./SPECS-BACKEND.md#21-userservice-참조-구현)를 참조
-- `GET /me`는 인증 의존성에서 이미 조회한 User 객체를 그대로 반환 (추가 DB 조회 없음)
+- `GET /api/v1/users/me`는 `is_admin`을 포함하여 반환 (`ADMIN_EMAIL` 기반)
 
 ---
 
 ## 4. Pydantic Schemas
 
-### 4.1 Create / Update / Response 패턴
+### 4.1 User Schemas
 
 ```python
-import re
-from pydantic import field_validator
+# schemas/user.py
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict
 
 
-def validate_password(password: str) -> str:
-    """비밀번호 정책: 8-72자, 소문자/대문자/숫자/특수문자 중 3종 이상."""
-    if len(password) < 8:
-        raise ValueError("Password must be at least 8 characters")
-    if len(password) > 72:
-        raise ValueError("Password must be at most 72 characters")
-    checks = [
-        bool(re.search(r"[a-z]", password)),
-        bool(re.search(r"[A-Z]", password)),
-        bool(re.search(r"\d", password)),
-        bool(re.search(r'[!@#$%^&*(),.?":{}|<>]', password)),
-    ]
-    if sum(checks) < 3:
-        raise ValueError(
-            "Password must contain at least 3 of: lowercase, uppercase, digit, special character"
-        )
-    return password
-
-
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
-
-    @field_validator("password")
-    @classmethod
-    def check_password(cls, v: str) -> str:
-        return validate_password(v)
-
-
-class UserUpdate(BaseModel):
-    name: str | None = None
-
-
-class ChangePasswordRequest(BaseModel):
-    current_password: str
-    new_password: str
-
-    @field_validator("new_password")
-    @classmethod
-    def check_new_password(cls, v: str) -> str:
-        return validate_password(v)
-
-
-# api/v1/endpoints/users.py (발췌)
-# POST /api/v1/users/me/password — 비밀번호 변경
-# current_password 검증 필수, 실패 시 401
-
-
-class UserResponse(BaseModel):
+class UserMeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
-    email: EmailStr
+    email: str
     name: str
+    picture_url: str | None
     is_active: bool
     created_at: datetime
     updated_at: datetime
-```
+    is_admin: bool
 
-### 4.2 PaginatedResponse 제네릭
 
-```python
-class PaginatedResponse(BaseModel, Generic[T]):
-    items: Sequence[T]
+class AdminUserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    email: str
+    name: str
+    picture_url: str | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None
+
+
+class AdminUserListResponse(BaseModel):
+    items: list[AdminUserResponse]
     total: int
     page: int
     size: int

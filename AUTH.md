@@ -18,6 +18,7 @@
 
 JWT 기반 인증과 BFF(Backend For Frontend) 패턴을 사용합니다.
 
+- **로그인 방식**: Google OAuth(OIDC) only (Authorization Code + PKCE)
 - **Access Token**: JWT (HS256, 15분) — httpOnly 쿠키
 - **Refresh Token**: UUID v4 (7일) — Redis + httpOnly 쿠키
 - **쿠키 설정**: BFF (Next.js API Route)가 담당 — Backend는 JSON body로 토큰 반환
@@ -38,58 +39,36 @@ JWT 기반 인증과 BFF(Backend For Frontend) 패턴을 사용합니다.
 ## 3. 인증 플로우
 
 ```
-1. 로그인
-   Client ──POST /api/auth/login──▶ BFF ──▶ FastAPI
-                                              │
-                                              ├─ 사용자 인증 (bcrypt 비교)
-                                              ├─ Access Token 생성 (JWT, 15분)
-                                              ├─ Refresh Token 생성 (UUID)
-                                              ├─ Redis에 Refresh Token 저장
-                                              │
-   Client ◀── Set-Cookie(httpOnly) ◀── BFF ◀──┘
+1. Google OAuth 로그인 시작
+   Client ──GET /api/auth/google/login──▶ Next.js (BFF)
+                                           │
+                                           └─ Google authorize로 redirect (state + PKCE)
 
-2. 인증된 요청
-   Client ──GET /api/users/me──▶ BFF ──▶ FastAPI
-                                          │
-                                          ├─ Authorization 헤더에서 JWT 추출
-                                          ├─ JWT 검증 (서명, 만료)
-                                          ├─ 사용자 조회
-                                          │
-   Client ◀── 200 User ◀── BFF ◀─────────┘
+2. Google OAuth 콜백
+   Client ──GET /api/auth/google/callback──▶ Next.js (BFF)
+                                               │
+                                               ├─ state/code_verifier 검증
+                                               ├─ POST /api/v1/auth/google/exchange (Backend)
+                                               └─ 토큰 수신 → httpOnly 쿠키 설정 → /dashboard redirect
 
-3. 토큰 갱신
-   Client ──POST /api/auth/refresh──▶ BFF ──▶ FastAPI
-                                       │        │
-                                       │        ├─ Body에서 refresh_token 추출
-                                       │        ├─ Redis에서 유효성 확인
-                                       │        ├─ 기존 Refresh Token 삭제 (Rotation)
-                                       │        ├─ 새 Access + Refresh Token 생성
-                                       │        ├─ Redis에 새 Refresh Token 저장
-                                       │        │
-   Client ◀── Set-Cookie(httpOnly) ◀── BFF ◀──┘
+3. 인증된 API 요청
+   Client ──GET /api/v1/users/me──▶ Next.js (BFF catch-all) ──▶ FastAPI
                                        │
-                                       └─ 쿠키에서 refresh_token 추출 → Body로 Backend에 전달
+                                       └─ 쿠키 access_token → Authorization 헤더 첨부
 
-4. 로그아웃
-   Client ──POST /api/auth/logout──▶ BFF ──▶ FastAPI
-                                              │
-                                              ├─ Redis에서 Refresh Token 삭제
-                                              │
-   Client ◀── Clear-Cookie ◀── BFF ◀─────────┘
+4. Silent Refresh (자동 토큰 갱신)
+   Backend 401 응답 시 Next.js (BFF)가 refresh_token 쿠키로
+   POST /api/v1/auth/refresh를 호출하여 Rotation을 수행하고 원 요청을 1회 재시도합니다.
 
-5. 회원가입 (자동 로그인)
-   Client ──POST /api/auth/register──▶ BFF ──▶ FastAPI
-                                                  │
-                                                  ├─ UserCreate 스키마 검증
-                                                  ├─ 이메일 중복 확인
-                                                  ├─ 비밀번호 해싱 + 사용자 생성
-                                                  │
-                                              BFF ◀──┘ (UserResponse)
-                                                  │
-                                                  ├─ BFF가 동일 credentials로 login API 호출
-                                                  ├─ 토큰 수신 → 쿠키 설정
-                                                  │
-   Client ◀── Set-Cookie(httpOnly) ◀── BFF ◀──┘
+5. 로그아웃
+   Client ──POST /api/auth/logout──▶ Next.js (BFF) ──▶ FastAPI (/api/v1/auth/logout)
+                                       │
+                                       └─ 쿠키 삭제 + Redis 세션 정리
+
+6. (E2E 전용) Test Login
+   Client(Playwright) ──POST /api/auth/test-login──▶ Next.js (BFF)
+                                                      │
+                                                      └─ POST /api/v1/auth/test-login (Backend)
 ```
 
 ---
@@ -143,12 +122,11 @@ Backend는 JSON body로 토큰을 반환하고, BFF(Next.js API Route)가 쿠키
 | 쿠키 | 값 | httpOnly | secure | sameSite | path | maxAge |
 |------|-----|----------|--------|----------|------|--------|
 | `access_token` | JWT 문자열 | true | true (prod) | lax | `/` | 15분 (900초) |
-| `refresh_token` | UUID v4 | true | true (prod) | lax | `/api/auth` | 7일 (604800초) |
+| `refresh_token` | UUID v4 | true | true (prod) | lax | `/api` | 7일 (604800초) |
 
-> **refresh_token path 제한 (`/api/auth`):** 브라우저는 `path=/api/auth` 쿠키를 `/api/auth/*` 요청에만 자동 전송합니다.
-> BFF 프록시의 Silent Refresh는 Next.js 서버 사이드에서 실행되므로, `cookies()` API를 통해
-> path와 무관하게 모든 쿠키에 접근할 수 있습니다. 이 설계는 보안(불필요한 쿠키 전송 방지)과
-> 기능(Silent Refresh)을 모두 충족합니다.
+> **refresh_token path (`/api`):** Silent Refresh는 `/api/v1/*` 요청을 처리하는 BFF catch-all에서 실행됩니다.
+> 브라우저는 쿠키 `path`가 매칭되는 요청에만 쿠키를 전송하므로, refresh_token은 `/api/v1/*`에도 포함되어야 합니다.
+> 따라서 refresh_token은 `/api`로 scope 하여 `/api/v1/*` 및 `/api/auth/*`에서 모두 사용 가능하게 합니다.
 
 - **Backend 응답**: `TokenResponse { access_token, refresh_token, token_type }` (JSON body)
 - **BFF 역할**: Backend 응답 수신 → `Set-Cookie` 헤더로 httpOnly 쿠키 설정 → 클라이언트에 전달
@@ -160,28 +138,29 @@ Backend는 JSON body로 토큰을 반환하고, BFF(Next.js API Route)가 쿠키
 
 ## 6. 참조 구현
 
-Auth 관련 Backend 구현 코드(스키마, Security 함수, AuthService, 인증 의존성, 엔드포인트)는 [SPECS-BACKEND.md §3](./SPECS-BACKEND.md#3-auth)을 참조하세요.
+Auth 관련 Backend 구현 코드(스키마, AuthService, Google OAuth exchange, refresh/logout, test-login gate)는 [SPECS-BACKEND.md](./SPECS-BACKEND.md)를 참조하세요.
 
-Auth 관련 Frontend 구현 코드(쿠키 헬퍼, BFF 인증 라우트, 인증 미들웨어, 로그인 폼, Auth Hooks)는 [SPECS-FRONTEND.md §1.2~1.12](./SPECS-FRONTEND.md)를 참조하세요.
+Auth 관련 Frontend 구현 코드(BFF 프록시, 쿠키 헬퍼, Google OAuth 라우트, refresh/logout, test-login gate, 미들웨어)는 [SPECS-FRONTEND.md](./SPECS-FRONTEND.md)를 참조하세요.
 
 ---
 
 ## 7. 인증 규칙 체크리스트
 
 **Backend:**
-- [ ] 비밀번호는 bcrypt로 해싱 (평문 저장/비교 금지)
 - [ ] JWT secret은 환경변수(`SECRET_KEY`)로 관리 (하드코딩 금지)
 - [ ] Refresh Token은 Redis에 저장, TTL 설정
 - [ ] Token Rotation + Replay Detection 적용
-- [ ] Rate Limiting: login 5/min, refresh 10/min
+- [ ] Google OAuth: state + PKCE 필수, open redirect 금지
+- [ ] Test-login은 E2E 전용: `AUTH_TEST_MODE=true` + secret header gate, 비활성 시 404, OpenAPI 노출 금지
 - [ ] 인증 실패 시 401 `UNAUTHORIZED` 반환
 - [ ] 에러 응답에 스택트레이스 노출 금지
 
 **Frontend:**
 - [ ] 토큰은 httpOnly 쿠키에만 저장 (`localStorage` 금지)
 - [ ] BFF가 쿠키 설정 (Backend는 JSON body만 반환)
-- [ ] Auth 요청은 BFF 전용 라우트 사용 (openapi-ts SDK 미사용)
+- [ ] Auth 요청은 Next.js `/api/*`로만 수행 (브라우저에서 Backend 직접 호출 금지)
 - [ ] Silent Refresh: BFF 프록시에서 자동 토큰 갱신
 - [ ] 401 도달 시 `/login` 리다이렉트 (QueryClient 글로벌 핸들러)
-- [ ] `refresh_token` 쿠키 path는 `/api/auth`로 제한
-- [ ] BFF 프록시 테스트: 인증 헤더 전달, Silent Refresh, 에러 전달 ([SPECS-FRONTEND.md §1.9](./SPECS-FRONTEND.md#19-bff-프록시-테스트))
+- [ ] `refresh_token` 쿠키 path는 `/api`
+- [ ] Test-login은 E2E 전용: 비활성 시 `/api/auth/test-login`은 404
+- [ ] BFF 프록시 테스트: 인증 헤더 전달, Silent Refresh, 에러 전달 ([SPECS-FRONTEND.md](./SPECS-FRONTEND.md))
