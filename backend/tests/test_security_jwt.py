@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import jwt
@@ -51,3 +52,19 @@ def test_verify_access_token_rejects_wrong_token_type(
 
     with pytest.raises(UnauthorizedException):
         verify_access_token(token)
+
+
+def test_create_access_token_loads_secret_key_from_settings_when_env_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setattr(
+        "app.core.security.get_settings",
+        lambda: SimpleNamespace(SECRET_KEY=TEST_SECRET),
+        raising=False,
+    )
+
+    token = create_access_token(uuid4())
+    payload = jwt.decode(token, TEST_SECRET, algorithms=["HS256"])
+
+    assert payload["type"] == "access"

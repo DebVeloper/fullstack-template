@@ -5,6 +5,7 @@ from uuid import UUID
 import jwt
 from pydantic import ValidationError
 
+from app.core.config import get_settings
 from app.core.exceptions import UnauthorizedException
 from app.schemas.auth import TokenPayload
 
@@ -14,9 +15,18 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 15
 
 def _get_secret_key() -> str:
     secret_key = os.getenv("SECRET_KEY")
-    if not secret_key:
+    if secret_key:
+        return secret_key
+
+    try:
+        configured_secret_key = get_settings().SECRET_KEY
+    except ValidationError as exc:
+        raise RuntimeError("SECRET_KEY environment variable is required") from exc
+
+    if not configured_secret_key:
         raise RuntimeError("SECRET_KEY environment variable is required")
-    return secret_key
+
+    return configured_secret_key
 
 
 def create_access_token(user_id: UUID) -> str:
