@@ -57,6 +57,18 @@ a {
   color: #3e4d5c;
 }
 
+.login-error {
+  margin: 0;
+  width: fit-content;
+  max-width: min(100%, 42rem);
+  padding: 0.7rem 1rem;
+  border-radius: 0.8rem;
+  border: 1px solid #e6b5b5;
+  background: #fff3f3;
+  color: #8b1e1e;
+  font-weight: 600;
+}
+
 .cta-button {
   width: fit-content;
   min-height: 44px;
