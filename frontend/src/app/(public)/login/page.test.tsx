@@ -19,9 +19,12 @@ describe("LoginPage", () => {
 
     render(page);
 
-    expect(screen.getByRole("alert")).toHaveTextContent(
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(
       "Your account is inactive. Contact your administrator."
     );
+    expect(alert).toHaveClass("status-message");
+    expect(alert).toHaveClass("status-message--error");
     expect(screen.getByRole("link", { name: "Continue with Google" })).toBeInTheDocument();
   });
 

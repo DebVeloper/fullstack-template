@@ -29,7 +29,7 @@ export default async function LoginPage({ searchParams }: LoginPageProps): Promi
       <section className="login-content" aria-labelledby="login-title">
         <h1 id="login-title">Sign in</h1>
         {loginErrorMessage ? (
-          <p className="login-error" role="alert">
+          <p className="status-message status-message--error" role="alert">
             {loginErrorMessage}
           </p>
         ) : null}

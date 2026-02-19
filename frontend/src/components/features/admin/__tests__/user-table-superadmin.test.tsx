@@ -148,4 +148,20 @@ describe("UserTable superadmin guard", () => {
     expect(deleteMutateAsync).toHaveBeenCalledWith("member-row");
     expect(unlockMutateAsync).not.toHaveBeenCalled();
   });
+
+  it("should render unified error notice style when users query fails", () => {
+    useAdminUsersMock.mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+      error: new Error("network failure")
+    } as ReturnType<typeof useAdminUsers>);
+
+    render(<UserTable />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load users.");
+    expect(alert).toHaveClass("status-message");
+    expect(alert).toHaveClass("status-message--error");
+  });
 });

@@ -57,16 +57,22 @@ a {
   color: #3e4d5c;
 }
 
-.login-error {
+.status-message {
   margin: 0;
   width: fit-content;
   max-width: min(100%, 42rem);
   padding: 0.7rem 1rem;
   border-radius: 0.8rem;
+  border: 1px solid #d5deea;
+  background: #f5f8fd;
+  color: #324759;
+  font-weight: 600;
+}
+
+.status-message--error {
   border: 1px solid #e6b5b5;
   background: #fff3f3;
   color: #8b1e1e;
-  font-weight: 600;
 }
 
 .cta-button {
@@ -435,10 +441,6 @@ a {
   margin: 0;
   font-size: 0.95rem;
   color: #324759;
-}
-
-.admin-users__status--error {
-  color: #8d1e2a;
 }
 
 @media (max-width: 960px) {

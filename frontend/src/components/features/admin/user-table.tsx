@@ -57,7 +57,7 @@ export function UserTable(): ReactElement {
         : "Failed to load users.";
 
     return (
-      <p className="admin-users__status admin-users__status--error" role="alert">
+      <p className="status-message status-message--error" role="alert">
         {message}
       </p>
     );
