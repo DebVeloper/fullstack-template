@@ -5,7 +5,6 @@ const adminUsersListKey = [...adminUsersRootKey, "list"] as const;
 export interface AdminUsersListQuery {
   page: number;
   size: number;
-  include_deleted: boolean;
 }
 
 export const userKeys = {

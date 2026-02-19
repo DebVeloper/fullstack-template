@@ -205,7 +205,7 @@ test.describe("auth/admin flows with test-mode login", () => {
     ).toBeVisible()
 
     const listResponse = await page.request.get(
-      "/api/v1/admin/users?page=1&size=100&include_deleted=true"
+      "/api/v1/admin/users?page=1&size=100"
     )
     expect(listResponse.status()).toBe(200)
 

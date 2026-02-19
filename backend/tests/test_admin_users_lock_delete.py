@@ -1,6 +1,6 @@
 import os
 from collections.abc import AsyncGenerator, Generator
-from datetime import UTC, datetime
+from datetime import datetime
 from inspect import isawaitable
 from uuid import uuid4
 
@@ -167,7 +167,7 @@ async def test_admin_users_requires_admin_authorization(
     }
 
 
-async def test_admin_users_list_excludes_deleted_users_by_default(
+async def test_admin_users_list_returns_users_by_default(
     admin_client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:
@@ -180,12 +180,6 @@ async def test_admin_users_list_excludes_deleted_users_by_default(
         db_session,
         email="active@example.com",
         name="Active",
-    )
-    await create_user(
-        db_session,
-        email="deleted@example.com",
-        name="Deleted",
-        deleted_at=datetime.now(UTC),
     )
 
     response = await admin_client.get(
@@ -201,20 +195,6 @@ async def test_admin_users_list_excludes_deleted_users_by_default(
     returned_emails = {item["email"] for item in body["items"]}
     assert returned_emails == {"admin@example.com", "active@example.com"}
     assert all(item["deleted_at"] is None for item in body["items"])
-
-    include_deleted_response = await admin_client.get(
-        "/api/v1/admin/users",
-        params={"include_deleted": "true"},
-        headers=auth_headers(admin_user),
-    )
-    include_deleted_body = include_deleted_response.json()
-    include_deleted_emails = {item["email"] for item in include_deleted_body["items"]}
-    assert include_deleted_body["total"] == 3
-    assert include_deleted_emails == {
-        "admin@example.com",
-        "active@example.com",
-        "deleted@example.com",
-    }
 
 
 async def test_admin_can_lock_and_unlock_user_and_revoke_sessions(
@@ -338,15 +318,11 @@ async def test_admin_can_delete_user_and_revoke_sessions(
 
     list_with_deleted_response = await admin_client.get(
         "/api/v1/admin/users",
-        params={"include_deleted": "true"},
         headers=auth_headers(admin_user),
     )
     list_with_deleted_body = list_with_deleted_response.json()
     assert list_with_deleted_response.status_code == 200
-    ids_with_deleted = {
-        str(item["id"]) for item in list_with_deleted_body["items"]
-    }
-    assert str(target_user.id) not in ids_with_deleted
+    assert list_with_deleted_body == list_without_deleted_body
 
     deleted_refresh_mapping = await resolve_redis_result(
         redis_session.get(f"{REFRESH_KEY_PREFIX}{refresh_token}")

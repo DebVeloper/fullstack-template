@@ -29,14 +29,12 @@ export interface AdminUsersListResponse {
 export interface UseAdminUsersOptions {
   page?: number;
   size?: number;
-  include_deleted?: boolean;
 }
 
 function normalizeQuery(options: UseAdminUsersOptions): AdminUsersListQuery {
   return {
     page: options.page ?? 1,
-    size: options.size ?? 20,
-    include_deleted: options.include_deleted ?? false
+    size: options.size ?? 20
   };
 }
 
@@ -44,7 +42,6 @@ function buildAdminUsersUrl(query: AdminUsersListQuery): string {
   const searchParams = new URLSearchParams();
   searchParams.set("page", String(query.page));
   searchParams.set("size", String(query.size));
-  searchParams.set("include_deleted", String(query.include_deleted));
 
   return `${ADMIN_USERS_PATH}?${searchParams.toString()}`;
 }
