@@ -123,6 +123,8 @@ a {
   z-index: 20;
   min-height: 4.5rem;
   display: flex;
+  justify-content: space-between;
+  gap: 1rem;
   align-items: center;
   padding: 0.85rem 1.25rem;
   background: color-mix(in oklab, #ffffff 80%, transparent);
@@ -149,6 +151,84 @@ a {
   font-size: 0.8rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.global-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.global-header__profile {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid #d4deea;
+  border-radius: 999px;
+  background: color-mix(in oklab, #ffffff 85%, transparent);
+}
+
+.global-header__avatar {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 0.82rem;
+  font-weight: 800;
+  color: #ffffff;
+  background: #183048;
+}
+
+.global-header__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.global-header__name,
+.global-header__email {
+  margin: 0;
+  line-height: 1.2;
+}
+
+.global-header__name {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #233547;
+}
+
+.global-header__email {
+  font-size: 0.75rem;
+  color: #4b5f72;
+}
+
+.global-header__logout {
+  min-height: 44px;
+  border: 1px solid #c6d3e4;
+  border-radius: 999px;
+  padding: 0.55rem 0.92rem;
+  font-weight: 700;
+  color: #1d2e3f;
+  background: #ffffff;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.global-header__logout:hover:enabled {
+  background: #edf3fb;
+  border-color: #bacde4;
+}
+
+.global-header__logout:focus-visible {
+  outline: 3px solid #4b7bec;
+  outline-offset: 2px;
+}
+
+.global-header__logout:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 .dashboard-shell__body {
@@ -350,6 +430,16 @@ a {
 }
 
 @media (max-width: 960px) {
+  .global-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .global-header__actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .dashboard-shell__body {
     grid-template-columns: 1fr;
   }
