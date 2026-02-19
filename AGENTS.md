@@ -19,6 +19,84 @@
 - **3-Layer 분리**: Router → Service → Repository (Router에서 직접 DB 접근 금지)
 - **BFF 패턴**: 클라이언트는 Next.js API Route를 통해서만 백엔드에 접근
 
+## 빠른 네비게이션
+
+### AGENTS 계층 (작업 위치별 추가 규칙)
+
+- `backend/AGENTS.md` — FastAPI/DB/Redis/3-Layer 규칙 + 명령어
+- `backend/tests/AGENTS.md` — pytest fixture/통합 테스트(DB/Redis) 실행 규칙
+- `backend/app/services/AGENTS.md` — refresh rotation/replay detection, Google OAuth exchange, 세션 무효화
+- `frontend/AGENTS.md` — Next.js 15(App Router)/BFF/auth 쿠키 규칙 + 명령어
+- `frontend/src/app/api/AGENTS.md` — BFF proxy(`[...path]`) + auth route handlers 규칙
+- `frontend/src/client/AGENTS.md` — openapi-ts 자동 생성 코드(수동 수정 금지)
+- `frontend/src/hooks/queries/AGENTS.md` — TanStack Query 커스텀 훅/키 팩토리 패턴
+- `frontend/src/components/AGENTS.md` — 컴포넌트 구조(layouts/features), a11y/perf 규칙
+- `frontend/e2e/AGENTS.md` — Playwright E2E + test-login(AUTH_TEST_MODE) 실행 규칙
+- `infra/AGENTS.md` — docker compose(Postgres/Redis) + initdb 규칙
+
+### 핵심 엔트리포인트 (코드 네비게이션 시작점)
+
+- Backend: `backend/app/main.py`, `backend/app/api/v1/router.py`, `backend/app/api/dependencies.py`
+- Backend(Auth): `backend/app/api/v1/endpoints/auth.py`, `backend/app/services/auth_service.py`
+- Frontend(BFF): `frontend/src/app/api/[...path]/route.ts`
+- Frontend(Auth): `frontend/src/app/api/auth/*/route.ts`, `frontend/src/lib/auth-cookies.ts`, `frontend/src/middleware.ts`
+- Frontend(Dashboard): `frontend/src/app/(auth)/layout.tsx`, `frontend/src/components/layouts/dashboard-shell.tsx`
+
+### 자주 쓰는 명령어 (로컬)
+
+- Infra: `docker compose -f infra/docker-compose.yml up -d`
+- Backend: `cd backend && uv sync && uv run alembic upgrade head && uv run ruff check . && uv run mypy --strict . && uv run pytest`
+- Frontend: `cd frontend && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm run build`
+- E2E: `cd frontend && AUTH_TEST_MODE=true AUTH_TEST_SECRET=change-me pnpm test:e2e`
+- Generate API client: `cd frontend && pnpm run generate:api` (backend `:8000` 실행 필요)
+
+### 단일 테스트 실행 (자주 씀)
+
+- Backend(pytest)
+  - 파일: `cd backend && uv run pytest tests/test_users_me.py`
+  - 단일 테스트: `cd backend && uv run pytest tests/test_users_me.py::test_get_users_me_returns_current_user_with_is_admin_true`
+  - 패턴: `cd backend && uv run pytest -k "refresh"`
+- Frontend(vitest)
+  - 파일: `cd frontend && pnpm test -- src/tests/bff-proxy.test.ts`
+  - 단일 테스트명: `cd frontend && pnpm test -- -t "should refresh on 401"`
+- E2E(Playwright)
+  - spec: `cd frontend && AUTH_TEST_MODE=true AUTH_TEST_SECRET=change-me pnpm test:e2e -- e2e/auth-admin.spec.ts`
+  - grep: `cd frontend && AUTH_TEST_MODE=true AUTH_TEST_SECRET=change-me pnpm test:e2e -- -g "superadmin"`
+
+### 전역 하드 룰 (요약)
+
+- `.env`는 절대 커밋하지 않는다 (`.env.example`만 커밋)
+- Browser는 Backend(FastAPI)에 직접 호출 금지 → Next.js `/api/*` (BFF)만 사용
+- 토큰 저장소는 httpOnly 쿠키만 허용 (`localStorage` 금지)
+- Backend auth는 `Set-Cookie` 금지 → JSON body로 토큰 반환, 쿠키 설정은 BFF가 담당
+- API 요청/응답 JSON 키는 `snake_case` 고정 (camelCase 변환 라이브러리 금지)
+- 업데이트는 `PUT` 금지 → `PATCH`만 사용
+- FastAPI 엔드포인트는 `response_model` 필수 (openapi-ts 타입 생성 의존)
+- `frontend/src/client/`는 자동 생성 코드 → 수동 수정 금지, 필요 시 `pnpm run generate:api`
+
+### 코드 스타일 (요약)
+
+- **Imports**
+  - TS/TSX: 내부 모듈은 `@/*` alias 선호 (`frontend/tsconfig.json`), barrel import 금지
+  - Python: `from app...` absolute import 사용, 표준→서드파티→로컬 순서 (ruff `I` 규칙)
+- **Formatting**
+  - Python: ruff 기준 line-length 88 (`backend/pyproject.toml`)
+  - TS/TSX: 프로젝트에 prettier 없음 → 파일/디렉토리 기존 스타일을 따른다 (불필요한 reformat 금지)
+- **Types**
+  - TS strict + `any` 금지; `unknown`을 좁혀서 사용
+  - Python mypy strict; `cast()`는 최후 수단, 가능한 타입을 모델링(TypedDict 등)
+- **Naming / API**
+  - JSON key는 `snake_case` 고정; camelCase 변환 라이브러리 금지
+  - 업데이트는 `PUT` 금지 → `PATCH`만 사용
+- **Error Handling**
+  - Backend: `AppException` 기반 unified error envelope 사용, stacktrace/민감정보 노출 금지
+  - Frontend: `{ error: { code, message, details } }` envelope를 기본으로 처리 (`frontend/src/lib/api-error.ts`)
+
+### Cursor/Copilot 규칙
+
+- Cursor rules: 없음 (`.cursor/`, `.cursorrules` 미존재)
+- Copilot instructions: 없음 (`.github/copilot-instructions.md` 미존재)
+
 ---
 
 ## 1. 일반 규칙
@@ -67,18 +145,8 @@
 
 ## 스킬 참조
 
-추가 가이드라인이 필요하면 아래 스킬을 참조한다:
+추가 가이드라인이 필요하면 아래를 참조한다:
 
-**Backend** (`.agents/skills/`):
-- `fastapi-templates` — FastAPI 프로젝트 구조, async 패턴, 의존성 주입, 에러 처리
-- `python-patterns` — Python 개발 원칙, async 패턴, 타입 힌트, 프로젝트 구조
-- `supabase-postgres-best-practices` — PostgreSQL 쿼리 최적화, 인덱스, 커넥션 관리 (30개 규칙)
-
-**Frontend** (`.agents/skills/`):
-- `next-best-practices` — Next.js 파일 컨벤션, RSC 경계, 데이터 패턴, 메타데이터, 번들 최적화
-- `vercel-react-best-practices` — React/Next.js 성능 최적화 (Vercel 엔지니어링 가이드, 57개 규칙)
-- `frontend-design` — UI 컴포넌트/페이지 제작 시 디자인 품질 가이드
-- `web-design-guidelines` — UI 코드 리뷰, 접근성 감사, UX 베스트 프랙티스
-
-**Frontend — UI/UX** (plugin):
-- `/ui-ux-pro-max` — UI/UX 디자인 (50개 스타일, 21개 팔레트, 50개 폰트 페어링, shadcn/ui 통합)
+- Backend: `.agents/skills/fastapi-templates/`, `.agents/skills/python-patterns/`, `.agents/skills/supabase-postgres-best-practices/`
+- Frontend: `.agents/skills/next-best-practices/`, `.agents/skills/vercel-react-best-practices/`, `.agents/skills/frontend-design/`, `.agents/skills/web-design-guidelines/`
+- UI/UX plugin: `/ui-ux-pro-max`
