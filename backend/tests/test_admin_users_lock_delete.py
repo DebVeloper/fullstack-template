@@ -181,6 +181,12 @@ async def test_admin_users_list_returns_users_by_default(
         email="active@example.com",
         name="Active",
     )
+    await create_user(
+        db_session,
+        email="deleted@example.com",
+        name="Deleted",
+        deleted_at=datetime(2026, 1, 1, 0, 0),
+    )
 
     response = await admin_client.get(
         "/api/v1/admin/users",

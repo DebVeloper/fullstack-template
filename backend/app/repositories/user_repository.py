@@ -25,11 +25,8 @@ class UserRepository:
         *,
         page: int,
         size: int,
-        include_deleted: bool,
     ) -> list[User]:
-        query = select(User)
-        if not include_deleted:
-            query = query.where(User.deleted_at.is_(None))
+        query = select(User).where(User.deleted_at.is_(None))
 
         offset = (page - 1) * size
         result = await db.execute(
@@ -40,12 +37,8 @@ class UserRepository:
     async def count_users(
         self,
         db: AsyncSession,
-        *,
-        include_deleted: bool,
     ) -> int:
-        query = select(func.count()).select_from(User)
-        if not include_deleted:
-            query = query.where(User.deleted_at.is_(None))
+        query = select(func.count()).select_from(User).where(User.deleted_at.is_(None))
 
         result = await db.execute(query)
         return int(result.scalar_one())

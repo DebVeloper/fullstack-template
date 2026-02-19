@@ -35,15 +35,13 @@ async def list_users(
     *,
     page: int,
     size: int,
-    include_deleted: bool,
 ) -> AdminUserListResponse:
     users = await user_repository.list_users(
         db,
         page=page,
         size=size,
-        include_deleted=include_deleted,
     )
-    total = await user_repository.count_users(db, include_deleted=include_deleted)
+    total = await user_repository.count_users(db)
     pages = (total + size - 1) // size if total > 0 else 0
     return AdminUserListResponse(
         items=list(users),

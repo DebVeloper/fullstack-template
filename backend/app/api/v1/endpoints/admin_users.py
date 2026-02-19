@@ -20,19 +20,11 @@ async def list_admin_users(
     db: Annotated[AsyncSession, Depends(get_db)],
     page: Annotated[int, Query(ge=1)] = 1,
     size: Annotated[int, Query(ge=1, le=100)] = 20,
-    include_deleted: Annotated[
-        bool,
-        Query(
-            description="Deprecated: retained for compatibility only",
-            deprecated=True,
-        ),
-    ] = False,
 ) -> AdminUserListResponse:
     return await admin_user_service.list_users(
         db,
         page=page,
         size=size,
-        include_deleted=include_deleted,
     )
 
 
@@ -65,7 +57,7 @@ async def unlock_user(
 @router.delete(
     "/{user_id}",
     response_model=AdminUserResponse,
-    operation_id="soft_delete_user",
+    operation_id="delete_admin_user",
 )
 async def delete_user(
     user_id: UUID,
