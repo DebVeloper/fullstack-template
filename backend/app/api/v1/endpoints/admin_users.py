@@ -57,13 +57,13 @@ async def unlock_user(
 
 
 @router.delete("/{user_id}", response_model=AdminUserResponse)
-async def soft_delete_user(
+async def delete_user(
     user_id: UUID,
     admin: Annotated[AdminPrincipal, Depends(require_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[Redis, Depends(get_redis)],
 ) -> AdminUserResponse:
-    user = await admin_user_service.soft_delete_user(
+    user = await admin_user_service.delete_user(
         db,
         redis,
         user_id=user_id,

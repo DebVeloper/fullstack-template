@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -166,7 +167,7 @@ async def test_admin_users_requires_admin_authorization(
     }
 
 
-async def test_admin_users_list_excludes_soft_deleted_by_default(
+async def test_admin_users_list_excludes_deleted_users_by_default(
     admin_client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:
@@ -284,7 +285,7 @@ async def test_admin_can_lock_and_unlock_user_and_revoke_sessions(
     assert target_user.is_active is True
 
 
-async def test_admin_can_soft_delete_user_and_revoke_sessions(
+async def test_admin_can_delete_user_and_revoke_sessions(
     admin_client: AsyncClient,
     db_session: AsyncSession,
     redis_session: Redis,
@@ -316,10 +317,36 @@ async def test_admin_can_soft_delete_user_and_revoke_sessions(
 
     assert delete_response.status_code == 200
     delete_body = delete_response.json()
-    assert delete_body["deleted_at"] is not None
+    assert delete_body["id"] == str(target_user.id)
+    assert delete_body["email"] == "delete-target@example.com"
 
-    await db_session.refresh(target_user)
-    assert target_user.deleted_at is not None
+    user_result = await db_session.execute(
+        select(User.id).where(User.id == target_user.id)
+    )
+    assert user_result.scalar_one_or_none() is None
+
+    list_without_deleted_response = await admin_client.get(
+        "/api/v1/admin/users",
+        headers=auth_headers(admin_user),
+    )
+    list_without_deleted_body = list_without_deleted_response.json()
+    assert list_without_deleted_response.status_code == 200
+    ids_without_deleted = {
+        str(item["id"]) for item in list_without_deleted_body["items"]
+    }
+    assert str(target_user.id) not in ids_without_deleted
+
+    list_with_deleted_response = await admin_client.get(
+        "/api/v1/admin/users",
+        params={"include_deleted": "true"},
+        headers=auth_headers(admin_user),
+    )
+    list_with_deleted_body = list_with_deleted_response.json()
+    assert list_with_deleted_response.status_code == 200
+    ids_with_deleted = {
+        str(item["id"]) for item in list_with_deleted_body["items"]
+    }
+    assert str(target_user.id) not in ids_with_deleted
 
     deleted_refresh_mapping = await resolve_redis_result(
         redis_session.get(f"{REFRESH_KEY_PREFIX}{refresh_token}")

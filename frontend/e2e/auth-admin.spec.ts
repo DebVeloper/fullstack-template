@@ -149,7 +149,7 @@ test.describe("auth/admin flows with test-mode login", () => {
     }
   })
 
-  test("admin soft-delete blocks user test-login and dashboard access", async ({
+  test("admin delete blocks user test-login and dashboard access", async ({
     page,
     request,
     browser

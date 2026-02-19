@@ -5,7 +5,7 @@ Service 계층(비즈니스 로직). Auth/Google OAuth/관리자 기능의 핵�
 ## Main Modules
 
 - Token issuing/rotation/replay detection: `backend/app/services/auth_service.py`
-- Admin user management (lock/unlock/soft-delete + superadmin 보호): `backend/app/services/admin_user_service.py`
+- Admin user management (lock/unlock/delete + superadmin 보호): `backend/app/services/admin_user_service.py`
 - Google OAuth exchange + id_token verify(JWKS/RS256): `backend/app/services/google_oauth_service.py`
 
 ## Auth Rotation Invariants

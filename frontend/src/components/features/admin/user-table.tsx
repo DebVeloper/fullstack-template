@@ -7,7 +7,7 @@ import {
   type AdminUser,
   useAdminUsers,
   useLockAdminUser,
-  useSoftDeleteAdminUser,
+  useDeleteAdminUser,
   useUnlockAdminUser
 } from "@/hooks/queries/use-admin-users";
 import { useCurrentUser } from "@/hooks/queries/use-current-user";
@@ -19,15 +19,11 @@ function normalizeEmail(email: string): string {
 }
 
 function formatStatus(user: AdminUser): string {
-  if (user.deleted_at) {
-    return "Deleted";
+  if (user.deleted_at !== null || !user.is_active) {
+    return "Inactive";
   }
 
-  if (user.is_active) {
-    return "Active";
-  }
-
-  return "Locked";
+  return "Active";
 }
 
 export function UserTable(): ReactElement {
@@ -35,7 +31,7 @@ export function UserTable(): ReactElement {
   const usersQuery = useAdminUsers();
   const lockMutation = useLockAdminUser();
   const unlockMutation = useUnlockAdminUser();
-  const deleteMutation = useSoftDeleteAdminUser();
+  const deleteMutation = useDeleteAdminUser();
 
   const activeAdminEmail =
     currentUserQuery.data?.is_admin === true
@@ -85,7 +81,7 @@ export function UserTable(): ReactElement {
     await unlockMutation.mutateAsync(user.id);
   }
 
-  async function onSoftDelete(userId: string): Promise<void> {
+  async function onDelete(userId: string): Promise<void> {
     await deleteMutation.mutateAsync(userId);
   }
 
@@ -131,7 +127,7 @@ export function UserTable(): ReactElement {
                       className="admin-users-table__action admin-users-table__action--danger"
                       disabled={disableActions}
                       onClick={() => {
-                        void onSoftDelete(user.id);
+                        void onDelete(user.id);
                       }}
                     >
                       Delete

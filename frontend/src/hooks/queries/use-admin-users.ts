@@ -98,7 +98,7 @@ async function unlockAdminUser(userId: string): Promise<AdminUser> {
   });
 }
 
-async function softDeleteAdminUser(userId: string): Promise<AdminUser> {
+async function deleteAdminUser(userId: string): Promise<AdminUser> {
   return requestJson<AdminUser>(`${ADMIN_USERS_PATH}/${userId}`, {
     method: "DELETE"
   });
@@ -136,11 +136,11 @@ export function useUnlockAdminUser() {
   });
 }
 
-export function useSoftDeleteAdminUser() {
+export function useDeleteAdminUser() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: softDeleteAdminUser,
+    mutationFn: deleteAdminUser,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: adminUserKeys.lists() });
     }

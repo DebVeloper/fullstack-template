@@ -99,7 +99,7 @@ async def test_superadmin_cannot_be_locked(
     }
 
 
-async def test_superadmin_cannot_be_soft_deleted(
+async def test_superadmin_cannot_be_deleted(
     admin_client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:

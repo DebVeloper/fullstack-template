@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -87,7 +86,7 @@ async def unlock_user(
     return await user_repository.set_active_status(db, user=user, is_active=True)
 
 
-async def soft_delete_user(
+async def delete_user(
     db: AsyncSession,
     redis: Redis,
     *,
@@ -100,10 +99,6 @@ async def soft_delete_user(
 
     _ensure_not_superadmin(target_user=user, admin_email=admin_email)
 
-    updated_user = await user_repository.soft_delete(
-        db,
-        user=user,
-        deleted_at=datetime.now(UTC),
-    )
-    await auth_service.revoke_all_sessions(redis, user_id=str(updated_user.id))
-    return updated_user
+    deleted_user = await user_repository.delete(db, user=user)
+    await auth_service.revoke_all_sessions(redis, user_id=str(deleted_user.id))
+    return deleted_user

@@ -184,7 +184,7 @@ async def test_test_login_creates_user_and_returns_token_pair(
         (True, datetime.now(UTC)),
     ],
 )
-async def test_test_login_rejects_inactive_or_soft_deleted_user(
+async def test_test_login_rejects_inactive_or_deleted_user(
     auth_client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,

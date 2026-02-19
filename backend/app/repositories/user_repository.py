@@ -1,4 +1,3 @@
-from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -63,17 +62,9 @@ class UserRepository:
         await db.refresh(user)
         return user
 
-    async def soft_delete(
-        self,
-        db: AsyncSession,
-        *,
-        user: User,
-        deleted_at: datetime,
-    ) -> User:
-        user.deleted_at = deleted_at
-        user.is_active = False
+    async def delete(self, db: AsyncSession, *, user: User) -> User:
+        await db.delete(user)
         await db.flush()
-        await db.refresh(user)
         return user
 
     async def upsert_google_user(

@@ -133,7 +133,7 @@ async def test_refresh_rejects_inactive_user_and_revokes_sessions(
     assert inactive_sessions == set()
 
 
-async def test_refresh_rejects_soft_deleted_user_and_revokes_sessions(
+async def test_refresh_rejects_deleted_user_and_revokes_sessions(
     auth_client: AsyncClient,
     db_session: AsyncSession,
     redis_session: Redis,

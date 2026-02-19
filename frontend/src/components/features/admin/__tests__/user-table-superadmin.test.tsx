@@ -6,7 +6,7 @@ import { useCurrentUser } from "@/hooks/queries/use-current-user";
 import {
   useAdminUsers,
   useLockAdminUser,
-  useSoftDeleteAdminUser,
+  useDeleteAdminUser,
   useUnlockAdminUser
 } from "@/hooks/queries/use-admin-users";
 
@@ -20,14 +20,14 @@ vi.mock("@/hooks/queries/use-admin-users", () => ({
   useAdminUsers: vi.fn(),
   useLockAdminUser: vi.fn(),
   useUnlockAdminUser: vi.fn(),
-  useSoftDeleteAdminUser: vi.fn()
+  useDeleteAdminUser: vi.fn()
 }));
 
 const useCurrentUserMock = vi.mocked(useCurrentUser);
 const useAdminUsersMock = vi.mocked(useAdminUsers);
 const useLockAdminUserMock = vi.mocked(useLockAdminUser);
 const useUnlockAdminUserMock = vi.mocked(useUnlockAdminUser);
-const useSoftDeleteAdminUserMock = vi.mocked(useSoftDeleteAdminUser);
+const useDeleteAdminUserMock = vi.mocked(useDeleteAdminUser);
 
 const lockMutateAsync = vi.fn();
 const unlockMutateAsync = vi.fn();
@@ -97,10 +97,10 @@ beforeEach(() => {
     isPending: false
   } as unknown as ReturnType<typeof useUnlockAdminUser>);
 
-  useSoftDeleteAdminUserMock.mockReturnValue({
+  useDeleteAdminUserMock.mockReturnValue({
     mutateAsync: deleteMutateAsync,
     isPending: false
-  } as unknown as ReturnType<typeof useSoftDeleteAdminUser>);
+  } as unknown as ReturnType<typeof useDeleteAdminUser>);
 });
 
 describe("UserTable superadmin guard", () => {

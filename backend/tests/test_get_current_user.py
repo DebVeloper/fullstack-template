@@ -113,7 +113,7 @@ async def test_get_current_user_rejects_inactive_user(
     assert body["error"]["code"] == "UNAUTHORIZED"
 
 
-async def test_get_current_user_rejects_soft_deleted_user(
+async def test_get_current_user_rejects_deleted_user(
     db_session: AsyncSession,
     current_user_client: AsyncClient,
 ) -> None:

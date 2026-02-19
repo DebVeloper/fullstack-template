@@ -345,7 +345,7 @@ async def test_google_exchange_rejects_unverified_google_email(
         (True, datetime.now(UTC)),
     ],
 )
-async def test_google_exchange_rejects_inactive_or_soft_deleted_user(
+async def test_google_exchange_rejects_inactive_or_deleted_user(
     auth_client: AsyncClient,
     db_session: AsyncSession,
     redis_session: Redis,
@@ -356,7 +356,7 @@ async def test_google_exchange_rejects_inactive_or_soft_deleted_user(
     existing_user = User(
         google_sub="google-sub-locked",
         email="locked@example.com",
-        name="Locked User",
+        name="Inactive User",
         picture_url="https://example.com/locked.png",
         is_active=is_active,
         deleted_at=deleted_at,
@@ -380,7 +380,7 @@ async def test_google_exchange_rejects_inactive_or_soft_deleted_user(
         return {
             "sub": "google-sub-locked",
             "email": "locked@example.com",
-            "name": "Locked User",
+            "name": "Inactive User",
             "picture": "https://example.com/locked.png",
             "email_verified": True,
         }
