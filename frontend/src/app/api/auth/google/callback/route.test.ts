@@ -122,6 +122,45 @@ describe("GET /api/auth/google/callback", () => {
     expect(cookieStore.set).toHaveBeenCalledTimes(3);
   });
 
+  it("should redirect to login with account_inactive error when user is locked", async () => {
+    const cookieStore = createCookieStore({
+      google_oauth_state: "expected-state",
+      google_oauth_code_verifier: "pkce-verifier",
+      google_oauth_callback_url: "/admin/users"
+    });
+    cookiesMock.mockResolvedValue(cookieStore);
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "UNAUTHORIZED",
+            message: "User not found or inactive",
+            details: null
+          }
+        }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        }
+      )
+    );
+
+    const response = await GET(
+      createRequest("/api/auth/google/callback?code=oauth-code&state=expected-state")
+    );
+
+    expect(response.status).toBe(307);
+    const location = response.headers.get("location");
+    expect(location).toBeDefined();
+    const redirectUrl = new URL(location ?? "", "http://localhost:3000");
+    expect(redirectUrl.pathname).toBe("/login");
+    expect(redirectUrl.searchParams.get("error")).toBe("account_inactive");
+    expect(redirectUrl.searchParams.get("callbackUrl")).toBe("/admin/users");
+    expect(setAuthCookiesMock).not.toHaveBeenCalled();
+    expect(cookieStore.set).toHaveBeenCalledTimes(3);
+  });
+
   it("should sanitize external callback URL and redirect to dashboard", async () => {
     const cookieStore = createCookieStore({
       google_oauth_state: "expected-state",

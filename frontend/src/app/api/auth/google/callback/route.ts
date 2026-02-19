@@ -6,6 +6,10 @@ import { setAuthCookies } from "@/lib/auth-cookies";
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 const DEFAULT_CALLBACK_URL = "/dashboard";
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const LOGIN_PATH = "/login";
+const ACCOUNT_INACTIVE_ERROR_QUERY_VALUE = "account_inactive";
+const ACCOUNT_INACTIVE_BACKEND_ERROR_CODE = "UNAUTHORIZED";
+const ACCOUNT_INACTIVE_BACKEND_ERROR_MESSAGE = "User not found or inactive";
 
 const OAUTH_STATE_COOKIE_NAME = "google_oauth_state";
 const OAUTH_CODE_VERIFIER_COOKIE_NAME = "google_oauth_code_verifier";
@@ -16,6 +20,13 @@ type CookieStore = Pick<Awaited<ReturnType<typeof cookies>>, "get" | "set">;
 interface BackendTokenResponse {
   access_token: string;
   refresh_token: string;
+}
+
+interface BackendErrorPayload {
+  error?: {
+    code?: unknown;
+    message?: unknown;
+  };
 }
 
 function sanitizeCallbackUrl(callbackUrl: string | undefined): string {
@@ -73,6 +84,38 @@ function createOAuthErrorResponse(status: number, code: string, message: string)
   );
 }
 
+function isAccountInactiveError(errorPayload: unknown): boolean {
+  if (typeof errorPayload !== "object" || errorPayload === null) {
+    return false;
+  }
+
+  const payload = errorPayload as BackendErrorPayload;
+  const error = payload.error;
+
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  return (
+    error.code === ACCOUNT_INACTIVE_BACKEND_ERROR_CODE &&
+    error.message === ACCOUNT_INACTIVE_BACKEND_ERROR_MESSAGE
+  );
+}
+
+function createAccountInactiveRedirectUrl(
+  request: NextRequest,
+  callbackUrl: string | undefined
+): URL {
+  const loginUrl = new URL(LOGIN_PATH, request.url);
+  loginUrl.searchParams.set("error", ACCOUNT_INACTIVE_ERROR_QUERY_VALUE);
+
+  if (callbackUrl) {
+    loginUrl.searchParams.set("callbackUrl", sanitizeCallbackUrl(callbackUrl));
+  }
+
+  return loginUrl;
+}
+
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const cookieStore = await cookies();
   const code = request.nextUrl.searchParams.get("code");
@@ -117,6 +160,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
     try {
       const errorPayload = (await exchangeResponse.json()) as unknown;
+
+      if (exchangeResponse.status === 401 && isAccountInactiveError(errorPayload)) {
+        return NextResponse.redirect(createAccountInactiveRedirectUrl(request, callbackUrl));
+      }
+
       return NextResponse.json(errorPayload, { status: exchangeResponse.status });
     } catch {
       return createOAuthErrorResponse(exchangeResponse.status, "OAUTH_EXCHANGE_FAILED", "OAuth exchange failed");
