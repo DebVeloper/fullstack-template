@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import api_router
+from app.core.database import validate_database_schema
 from app.core.exceptions import AppException
 from app.core.logging import configure_logging
 from app.schemas.error import ErrorDetail, ErrorDetails, ErrorResponse
@@ -100,6 +101,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
+    await validate_database_schema()
     yield
 
 

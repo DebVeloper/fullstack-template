@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import get_settings
+from app.models.base import Base
 
 engine: AsyncEngine | None = None
 async_session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -40,3 +42,30 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+async def validate_database_schema() -> None:
+    required_tables = {table.name for table in Base.metadata.sorted_tables}
+    if not required_tables:
+        return
+
+    async with get_engine().connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT tablename FROM pg_catalog.pg_tables "
+                "WHERE schemaname = ANY (current_schemas(false))"
+            )
+        )
+        existing_tables = {str(row[0]) for row in result.fetchall()}
+
+    missing_tables = sorted(required_tables - existing_tables)
+    if not missing_tables:
+        return
+
+    missing_tables_label = ", ".join(missing_tables)
+    msg = (
+        "Database schema validation failed. "
+        f"Missing tables: {missing_tables_label}. "
+        "Run `uv run alembic upgrade head`."
+    )
+    raise RuntimeError(msg)
