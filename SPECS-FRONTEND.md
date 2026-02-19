@@ -21,7 +21,7 @@ openapi-ts SDK가 생성하는 경로에는 `/v1/` prefix가 포함되므로(Ope
 | `POST /api/v1/users` | `v1/users` | `BACKEND_URL/api/v1/users` |
 | `GET /api/v1/users?page=1` | `v1/users` + `?page=1` | `BACKEND_URL/api/v1/users?page=1` |
 
-인증 전용 라우트(`/api/auth/*`)는 `[...path]` catch-all에 도달하기 전에 전용 Route Handler(`/api/auth/login/route.ts` 등)가 먼저 매칭됩니다.
+인증 전용 라우트(`/api/auth/*`)는 `[...path]` catch-all에 도달하기 전에 전용 Route Handler(`/api/auth/google/login/route.ts`, `/api/auth/refresh/route.ts` 등)가 먼저 매칭됩니다.
 
 **401 처리 전략 (2단계):**
 
@@ -188,33 +188,61 @@ export const DELETE = proxyRequest;
 // src/lib/auth-cookies.ts
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
+const ACCESS_TOKEN_MAX_AGE_SECONDS = 60 * 15;
+const REFRESH_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
+
 interface AuthTokens {
   access_token: string;
   refresh_token: string;
 }
 
-type CookieStore = Awaited<ReturnType<typeof import("next/headers").cookies>>;
+type CookieStore = Pick<
+  Awaited<ReturnType<typeof import("next/headers").cookies>>,
+  "set"
+>;
+
+interface AuthCookieOptions {
+  httpOnly: true;
+  secure: boolean;
+  sameSite: "lax";
+  path: string;
+  maxAge: number;
+}
+
+const ACCESS_TOKEN_COOKIE_OPTIONS: AuthCookieOptions = {
+  httpOnly: true,
+  secure: IS_PRODUCTION,
+  sameSite: "lax",
+  path: "/",
+  maxAge: ACCESS_TOKEN_MAX_AGE_SECONDS
+};
+
+const REFRESH_TOKEN_COOKIE_OPTIONS: AuthCookieOptions = {
+  httpOnly: true,
+  secure: IS_PRODUCTION,
+  sameSite: "lax",
+  path: "/api",
+  maxAge: REFRESH_TOKEN_MAX_AGE_SECONDS
+};
+
+const CLEAR_ACCESS_TOKEN_COOKIE_OPTIONS: AuthCookieOptions = {
+  ...ACCESS_TOKEN_COOKIE_OPTIONS,
+  maxAge: 0
+};
+
+const CLEAR_REFRESH_TOKEN_COOKIE_OPTIONS: AuthCookieOptions = {
+  ...REFRESH_TOKEN_COOKIE_OPTIONS,
+  maxAge: 0
+};
 
 export function setAuthCookies(cookieStore: CookieStore, tokens: AuthTokens): void {
-  cookieStore.set("access_token", tokens.access_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 900,
-  });
-  cookieStore.set("refresh_token", tokens.refresh_token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: "lax",
-    path: "/api/auth",
-    maxAge: 604800,
-  });
+  cookieStore.set("access_token", tokens.access_token, ACCESS_TOKEN_COOKIE_OPTIONS);
+  cookieStore.set("refresh_token", tokens.refresh_token, REFRESH_TOKEN_COOKIE_OPTIONS);
 }
 
 export function clearAuthCookies(cookieStore: CookieStore): void {
-  cookieStore.delete("access_token");
-  cookieStore.delete("refresh_token");
+  cookieStore.set("access_token", "", CLEAR_ACCESS_TOKEN_COOKIE_OPTIONS);
+  cookieStore.set("refresh_token", "", CLEAR_REFRESH_TOKEN_COOKIE_OPTIONS);
 }
 ```
 
@@ -222,63 +250,55 @@ export function clearAuthCookies(cookieStore: CookieStore): void {
 
 Backend는 JSON body로 토큰을 반환하고, BFF가 쿠키를 설정합니다. 클라이언트에는 토큰을 노출하지 않습니다. 모든 라우트에서 [§1.2 쿠키 헬퍼](#12-쿠키-헬퍼)를 사용합니다. 쿠키 전략 상세는 [AUTH.md §5](./AUTH.md#5-쿠키-전략)를 참조하세요.
 
-#### Login
+#### Google OAuth Login
 
-```typescript
-// src/app/api/auth/login/route.ts
-import { cookies } from "next/headers";
-import { NextRequest, NextResponse } from "next/server";
-import { setAuthCookies } from "@/lib/auth-cookies";
+- 구현: `src/app/api/auth/google/login/route.ts`
+- 동작: state + PKCE(code_verifier) 생성 → 임시 httpOnly 쿠키 저장 → Google authorize로 redirect
+- callbackUrl: 상대경로만 허용 (open redirect 차단)
 
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+#### Google OAuth Callback
 
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-
-  const response = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    return NextResponse.json(error, { status: response.status });
-  }
-
-  const data = await response.json();
-  const cookieStore = await cookies();
-  setAuthCookies(cookieStore, data);
-
-  return NextResponse.json({ token_type: "bearer" });
-}
-```
+- 구현: `src/app/api/auth/google/callback/route.ts`
+- 동작: state/code_verifier 검증 → Backend `/api/v1/auth/google/exchange` 호출 → 토큰 수신 → 쿠키 설정 → callbackUrl(or `/dashboard`) redirect
 
 #### Refresh
 
 ```typescript
 // src/app/api/auth/refresh/route.ts
 import { cookies } from "next/headers";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { clearAuthCookies, setAuthCookies } from "@/lib/auth-cookies";
 
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-export async function POST() {
+interface BackendTokenResponse {
+  access_token: string;
+  refresh_token: string;
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  void request;
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get("refresh_token")?.value;
 
   if (!refreshToken) {
+    clearAuthCookies(cookieStore);
     return NextResponse.json(
-      { error: { code: "UNAUTHORIZED", message: "No refresh token", details: null } },
-      { status: 401 },
+      {
+        error: {
+          code: "UNAUTHORIZED",
+          message: "No refresh token",
+          details: null
+        }
+      },
+      { status: 401 }
     );
   }
 
   const response = await fetch(`${BACKEND_URL}/api/v1/auth/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+    body: JSON.stringify({ refresh_token: refreshToken })
   });
 
   if (!response.ok) {
@@ -287,8 +307,11 @@ export async function POST() {
     return NextResponse.json(error, { status: response.status });
   }
 
-  const data = await response.json();
-  setAuthCookies(cookieStore, data);
+  const tokens = (await response.json()) as BackendTokenResponse;
+  setAuthCookies(cookieStore, {
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token
+  });
 
   return NextResponse.json({ token_type: "bearer" });
 }
@@ -299,12 +322,13 @@ export async function POST() {
 ```typescript
 // src/app/api/auth/logout/route.ts
 import { cookies } from "next/headers";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { clearAuthCookies } from "@/lib/auth-cookies";
 
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-export async function POST() {
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  void request;
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get("refresh_token")?.value;
 
@@ -324,108 +348,143 @@ export async function POST() {
 }
 ```
 
-#### Register (자동 로그인)
+#### (E2E only) Test Login
 
 ```typescript
-// src/app/api/auth/register/route.ts
+// src/app/api/auth/test-login/route.ts
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
+
 import { setAuthCookies } from "@/lib/auth-cookies";
 
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://backend:8000";
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-export async function POST(req: NextRequest) {
-  const body = await req.json();
+interface TestLoginRequestBody {
+  email: string;
+  name?: string;
+}
 
-  // 1. Backend에 회원가입 요청
-  const registerRes = await fetch(`${BACKEND_URL}/api/v1/auth/register`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+interface BackendTokenResponse {
+  access_token: string;
+  refresh_token: string;
+}
 
-  if (!registerRes.ok) {
-    const error = await registerRes.json();
-    return NextResponse.json(error, { status: registerRes.status });
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  if (process.env.AUTH_TEST_MODE !== "true") {
+    return NextResponse.json(
+      {
+        error: {
+          code: "NOT_FOUND",
+          message: "Not found",
+          details: null
+        }
+      },
+      { status: 404 }
+    );
   }
 
-  // 2. 회원가입 성공 → 자동 로그인 (같은 credentials로 로그인)
-  const loginRes = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: body.email, password: body.password }),
-  });
-
-  if (!loginRes.ok) {
-    // 회원가입은 성공했지만 자동 로그인 실패 — 사용자에게 로그인 페이지 안내
-    return NextResponse.json({ registered: true, autoLogin: false }, { status: 201 });
+  const configuredSecret = process.env.AUTH_TEST_SECRET;
+  if (!configuredSecret) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "CONFIGURATION_ERROR",
+          message: "Missing AUTH_TEST_SECRET",
+          details: null
+        }
+      },
+      { status: 500 }
+    );
   }
 
-  const tokens = await loginRes.json();
+  const body = (await request.json()) as TestLoginRequestBody;
+
+  let response: Response;
+  try {
+    response = await fetch(`${BACKEND_URL}/api/v1/auth/test-login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-test-auth-secret": configuredSecret
+      },
+      body: JSON.stringify({ email: body.email, name: body.name })
+    });
+  } catch {
+    return NextResponse.json(
+      {
+        error: {
+          code: "BAD_GATEWAY",
+          message: "Backend service unavailable",
+          details: null
+        }
+      },
+      { status: 502 }
+    );
+  }
+
+  if (!response.ok) {
+    const error = await response.json();
+    return NextResponse.json(error, { status: response.status });
+  }
+
+  const tokens = (await response.json()) as BackendTokenResponse;
   const cookieStore = await cookies();
-  setAuthCookies(cookieStore, tokens);
+  setAuthCookies(cookieStore, {
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token
+  });
 
-  return NextResponse.json({ registered: true, autoLogin: true });
+  return new NextResponse(null, { status: 204 });
 }
 ```
 
-**Register 자동 로그인 실패 시 클라이언트 처리:**
+**Auth 이후 사용자 정보 획득 흐름:**
 
-BFF Register 라우트가 `{ registered: true, autoLogin: false }` (status 201)을 반환하면, 클라이언트에서 로그인 페이지로 안내합니다:
-
-```typescript
-// 회원가입 mutation onSuccess 핸들러
-const res = await fetch("/api/auth/register", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(data),
-});
-const result = await res.json();
-
-if (result.autoLogin === false) {
-  // 회원가입 성공, 자동 로그인 실패 → 로그인 페이지로 안내
-  toast.success("회원가입이 완료되었습니다. 로그인해주세요.");
-  router.push("/login");
-  return;
-}
-
-// 자동 로그인 성공 → 대시보드로 이동
-router.push("/dashboard");
-router.refresh();
-```
-
-**Login 후 사용자 정보 획득 흐름:**
-
-1. `POST /api/auth/login` (BFF) 성공 → 쿠키 설정 완료
-2. 로그인 성공 콜백에서 `queryClient.invalidateQueries({ queryKey: userKeys.me() })` 호출
-3. TanStack Query가 `GET /api/users/me` → BFF → Backend 요청
-4. Backend가 JWT에서 user_id 추출 → User 조회 → UserResponse 반환
+1. `/api/auth/google/callback` (BFF) 성공 → 쿠키 설정 완료, `/dashboard`로 redirect
+2. TanStack Query가 `GET /api/v1/users/me` 요청 (openapi-ts SDK)
+3. Next.js BFF catch-all(`/api/[...path]`)이 Backend로 프록시
 
 ### 1.4 Query Key Factory
 
 ```typescript
 // hooks/queries/keys.ts
+const usersRootKey = ["users"] as const;
+const adminUsersRootKey = ["admin-users"] as const;
+const adminUsersListKey = [...adminUsersRootKey, "list"] as const;
+
+export interface AdminUsersListQuery {
+  page: number;
+  size: number;
+}
+
 export const userKeys = {
-  all: ["users"] as const,
-  me: () => [...userKeys.all, "me"] as const,
-  lists: () => [...userKeys.all, "list"] as const,
-  list: (params: UserListParams) => [...userKeys.lists(), params] as const,
-  details: () => [...userKeys.all, "detail"] as const,
-  detail: (id: string) => [...userKeys.details(), id] as const,
+  all: usersRootKey,
+  me: () => [...usersRootKey, "me"] as const
+};
+
+export const adminUserKeys = {
+  all: adminUsersRootKey,
+  lists: () => adminUsersListKey,
+  list: (query: AdminUsersListQuery) => [...adminUsersListKey, query] as const
 };
 ```
 
 ```typescript
 // hooks/queries/use-current-user.ts
 import { useQuery } from "@tanstack/react-query";
-import { getMe } from "@/client/sdk.gen";
+
+import { getApiV1UsersMe as getMe } from "@/client/sdk.gen";
+import { apiClient } from "@/lib/api-client";
+
 import { userKeys } from "./keys";
+
+const CURRENT_USER_STALE_TIME = 60_000;
 
 export function useCurrentUser() {
   return useQuery({
     queryKey: userKeys.me(),
-    queryFn: () => getMe(),
-    staleTime: 5 * 60 * 1000,
+    queryFn: () => getMe({ client: apiClient }),
+    staleTime: CURRENT_USER_STALE_TIME
   });
 }
 ```
@@ -452,42 +511,68 @@ export function cn(...inputs: ClassValue[]) {
 // src/middleware.ts
 import { NextRequest, NextResponse } from "next/server";
 
-// 미인증 사용자도 접근 가능한 공개 라우트 (화이트리스트)
-const PUBLIC_ROUTES = ["/", "/login", "/register", "/about"];
-
-// 로그인 사용자가 접근하면 /dashboard로 리다이렉트할 라우트
-const AUTH_REDIRECT_ROUTES = ["/login", "/register"];
+const DEFAULT_AUTHENTICATED_REDIRECT_PATH = "/dashboard";
+const LOGIN_PATH = "/login";
+const PUBLIC_ROUTES = new Set(["/", LOGIN_PATH]);
 
 function isPublicRoute(pathname: string): boolean {
-  return PUBLIC_ROUTES.some(
-    (route) => pathname === route || pathname.startsWith(`${route}/`),
-  );
+  return PUBLIC_ROUTES.has(pathname);
 }
 
-export function middleware(req: NextRequest) {
-  const accessToken = req.cookies.get("access_token")?.value;
-  const { pathname } = req.nextUrl;
+function sanitizeCallbackUrl(callbackUrl: string): string {
+  const normalized = callbackUrl.trim();
 
-  // 공개 라우트가 아닌 모든 라우트는 인증 필요 (기본 보호)
-  if (!isPublicRoute(pathname) && !accessToken) {
-    const loginUrl = new URL("/login", req.url);
-    loginUrl.searchParams.set("callbackUrl", `${pathname}${req.nextUrl.search}`);
-    return NextResponse.redirect(loginUrl);
+  if (!normalized) {
+    return DEFAULT_AUTHENTICATED_REDIRECT_PATH;
   }
 
-  // 로그인된 사용자가 인증 전용 라우트 접근 → /dashboard 리다이렉트
-  if (accessToken && AUTH_REDIRECT_ROUTES.some((route) => pathname === route)) {
-    return NextResponse.redirect(new URL("/dashboard", req.url));
+  try {
+    const parsedUrl = new URL(normalized, "http://localhost");
+
+    if (parsedUrl.origin !== "http://localhost") {
+      return DEFAULT_AUTHENTICATED_REDIRECT_PATH;
+    }
+
+    if (!parsedUrl.pathname.startsWith("/")) {
+      return DEFAULT_AUTHENTICATED_REDIRECT_PATH;
+    }
+
+    if (parsedUrl.pathname.startsWith("//")) {
+      return DEFAULT_AUTHENTICATED_REDIRECT_PATH;
+    }
+
+    return `${parsedUrl.pathname}${parsedUrl.search}${parsedUrl.hash}`;
+  } catch {
+    return DEFAULT_AUTHENTICATED_REDIRECT_PATH;
+  }
+}
+
+export function middleware(request: NextRequest): NextResponse {
+  const accessToken = request.cookies.get("access_token")?.value;
+  const { pathname, search } = request.nextUrl;
+
+  if (pathname === LOGIN_PATH && accessToken) {
+    return NextResponse.redirect(
+      new URL(DEFAULT_AUTHENTICATED_REDIRECT_PATH, request.url)
+    );
+  }
+
+  if (isPublicRoute(pathname)) {
+    return NextResponse.next();
+  }
+
+  if (!accessToken) {
+    const callbackUrl = sanitizeCallbackUrl(`${pathname}${search}`);
+    const loginUrl = new URL(LOGIN_PATH, request.url);
+    loginUrl.searchParams.set("callbackUrl", callbackUrl);
+    return NextResponse.redirect(loginUrl);
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: [
-    // static files, _next, api 제외
-    "/((?!_next/static|_next/image|favicon.ico|api/).*)",
-  ],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/).*)"]
 };
 ```
 
@@ -754,161 +839,66 @@ export default function Loading() {
 }
 ```
 
-### 1.12 로그인 폼 / Auth Hooks
+### 1.12 Google OAuth Login (UI)
 
-Auth 요청은 BFF 전용 라우트(`/api/auth/*`)를 직접 fetch로 호출합니다. openapi-ts SDK는 사용하지 않습니다.
+이 템플릿은 이메일/비밀번호 폼을 제공하지 않고 **Google OAuth(OIDC) 로그인만** 제공합니다.
+
+- `/login`: Google 로그인 시작(`/api/auth/google/login`) 링크 렌더
+- `/api/auth/google/login`: state + PKCE 생성 → Google authorize redirect
+- `/api/auth/google/callback`: Backend `/api/v1/auth/google/exchange` 호출 → 쿠키 설정 → redirect
 
 ```typescript
-// src/components/features/auth/login-form.tsx
-"use client";
+// src/app/(public)/login/page.tsx
+import Link from "next/link";
+import type { ReactElement } from "react";
 
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
-import { useRouter, useSearchParams } from "next/navigation";
-import { toast } from "sonner";
-import { useLogin } from "@/hooks/queries/use-auth";
-import { ApiError } from "@/lib/api-error";
+interface LoginPageProps {
+  searchParams: Promise<{
+    callbackUrl?: string | string[];
+  }>;
+}
 
-const loginSchema = z.object({
-  email: z.string().email("올바른 이메일을 입력하세요"),
-  password: z.string().min(1, "비밀번호를 입력하세요"),
-});
+export default async function LoginPage({
+  searchParams
+}: LoginPageProps): Promise<ReactElement> {
+  const resolvedSearchParams = await searchParams;
+  const callbackUrlParam = Array.isArray(resolvedSearchParams.callbackUrl)
+    ? resolvedSearchParams.callbackUrl[0]
+    : resolvedSearchParams.callbackUrl;
 
-type LoginFormValues = z.infer<typeof loginSchema>;
-
-export function LoginForm() {
-  const router = useRouter();
-  const searchParams = useSearchParams();
-  const callbackUrl = searchParams.get("callbackUrl") ?? "/dashboard";
-  const loginMutation = useLogin();
-
-  const form = useForm<LoginFormValues>({
-    resolver: zodResolver(loginSchema),
-    defaultValues: { email: "", password: "" },
-  });
-
-  async function onSubmit(data: LoginFormValues) {
-    try {
-      await loginMutation.mutateAsync(data);
-      router.push(callbackUrl);
-      router.refresh();
-    } catch (error) {
-      if (error instanceof ApiError) {
-        if (error.isValidationError) {
-          Object.entries(error.fieldErrors).forEach(([field, message]) => {
-            form.setError(field as keyof LoginFormValues, { message });
-          });
-        } else {
-          toast.error(error.message);
-        }
-      } else {
-        toast.error("로그인 중 오류가 발생했습니다.");
-      }
-    }
-  }
+  const googleLoginHref = callbackUrlParam
+    ? `/api/auth/google/login?callbackUrl=${encodeURIComponent(callbackUrlParam)}`
+    : "/api/auth/google/login";
 
   return (
-    <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-      {/* 실제 UI는 shadcn/ui Form 컴포넌트 사용 권장 */}
-      <div>{/* email input */}</div>
-      <div>{/* password input */}</div>
-      <button type="submit" disabled={loginMutation.isPending}>
-        {loginMutation.isPending ? "로그인 중..." : "로그인"}
-      </button>
-    </form>
+    <main className="page-shell">
+      <section className="login-content" aria-labelledby="login-title">
+        <h1 id="login-title">Sign in</h1>
+        <p>Continue with your Google account to access the dashboard.</p>
+        <Link
+          href={googleLoginHref}
+          className="cta-button"
+          aria-label="Continue with Google"
+        >
+          Continue with Google
+        </Link>
+      </section>
+    </main>
   );
 }
 ```
 
-**useLogin / useLogout mutation hooks:**
-
-```typescript
-// hooks/queries/use-auth.ts
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ApiError } from "@/lib/api-error";
-import { userKeys } from "./keys";
-
-export function useLogin() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async (data: { email: string; password: string }) => {
-      const res = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) {
-        const body = await res.json();
-        throw new ApiError(res.status, body.error);
-      }
-      return res.json();
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: userKeys.me() });
-    },
-  });
-}
-
-export function useLogout() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async () => {
-      await fetch("/api/auth/logout", { method: "POST" });
-    },
-    onSuccess: () => {
-      queryClient.clear();
-      window.location.replace("/login");
-    },
-  });
-}
-```
-
 **Auth 요청 규칙:**
-- 로그인, 회원가입, 토큰 갱신, 로그아웃은 **BFF 전용 라우트**(`/api/auth/*`)를 `fetch()`로 직접 호출합니다
-- openapi-ts SDK가 생성하는 auth 함수(`login()`, `refresh()` 등)는 **사용하지 않습니다**
-  - SDK의 auth 함수는 BFF를 우회하므로 쿠키가 설정되지 않습니다
-- openapi-ts SDK는 **인증된 일반 API 요청**(users, posts 등)에만 사용합니다
+- Google OAuth(login/callback), refresh/logout, test-login은 **BFF 전용 라우트**(`/api/auth/*`)를 사용합니다 (SDK 금지)
+- openapi-ts SDK는 **인증된 일반 API 요청**(`/api/v1/*`)에만 사용합니다 → BFF catch-all(`/api/[...path]`)이 프록시
 
-### 1.13 테스트 설정 + 컴포넌트/훅 테스트
+### 1.13 테스트 설정 + 훅 테스트
 
 #### 테스트 설정
 
 ```typescript
 // src/tests/setup.ts
 import "@testing-library/jest-dom/vitest";
-```
-
-#### 컴포넌트 테스트 예시
-
-```typescript
-// src/components/features/auth/__tests__/login-form.test.tsx
-import { screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { renderWithProviders } from "@/tests/utils";
-import { LoginForm } from "../login-form";
-import { http, HttpResponse } from "msw";
-import { setupServer } from "msw/node";
-
-const server = setupServer();
-beforeAll(() => server.listen());
-afterEach(() => server.resetHandlers());
-afterAll(() => server.close());
-
-describe("LoginForm", () => {
-  it("should display error message when login fails", async () => {
-    server.use(
-      http.post("/api/auth/login", () =>
-        HttpResponse.json(
-          { error: { code: "UNAUTHORIZED", message: "Invalid email or password", details: null } },
-          { status: 401 },
-        ),
-      ),
-    );
-    renderWithProviders(<LoginForm />);
-    // ... test interaction
-  });
-});
 ```
 
 #### 훅 테스트 예시

@@ -42,114 +42,101 @@
 
 ```
 fullstack-template/
-├── frontend/                    # Next.js 애플리케이션
-│   ├── src/
-│   │   ├── app/                 # App Router (라우팅 & 페이지)
-│   │   │   ├── (auth)/          # 인증 필요 라우트 그룹
-│   │   │   ├── (public)/        # 공개 라우트 그룹
-│   │   │   ├── api/             # BFF API Routes (프록시)
-│   │   │   │   ├── auth/        # 인증 전용 BFF 라우트
-│   │   │   │   │   ├── login/
-│   │   │   │   │   │   └── route.ts
-│   │   │   │   │   ├── register/
-│   │   │   │   │   │   └── route.ts
-│   │   │   │   │   ├── refresh/
-│   │   │   │   │   │   └── route.ts
-│   │   │   │   │   └── logout/
-│   │   │   │   │       └── route.ts
-│   │   │   │   └── [...path]/
-│   │   │   │       └── route.ts  # 범용 프록시
-│   │   │   ├── layout.tsx       # 루트 레이아웃
-│   │   │   └── page.tsx         # 홈페이지
-│   │   ├── components/
-│   │   │   ├── ui/              # shadcn/ui 기본 컴포넌트
-│   │   │   ├── features/        # 비즈니스 로직 컴포넌트
-│   │   │   │   └── auth/        # 인증 관련 컴포넌트
-│   │   │   └── layouts/         # 레이아웃 컴포넌트
-│   │   ├── hooks/
-│   │   │   └── queries/         # TanStack Query 커스텀 훅
-│   │   │       └── use-auth.ts
-│   │   ├── lib/                 # 유틸리티, API 클라이언트
-│   │   │   └── error-messages.ts
-│   │   ├── client/              # openapi-ts 자동 생성 (수동 수정 금지)
-│   │   ├── types/               # TypeScript 타입 정의
-│   │   └── middleware.ts        # 인증 라우트 보호 미들웨어
-│   ├── e2e/                     # Playwright E2E 테스트
-│   ├── public/                  # 정적 파일
-│   ├── next.config.ts
-│   ├── tsconfig.json
-│   ├── vitest.config.ts
-│   ├── playwright.config.ts
-│   ├── openapi-ts.config.ts
-│   └── package.json
-├── backend/                     # FastAPI 애플리케이션
+├── infra/                        # PostgreSQL + Redis (docker compose)
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── initdb/
+├── backend/                      # FastAPI (uv)
 │   ├── app/
 │   │   ├── api/
-│   │   │   ├── v1/
-│   │   │   │   ├── endpoints/   # API 엔드포인트 모듈
-│   │   │   │   │   ├── auth.py
-│   │   │   │   │   ├── health.py
-│   │   │   │   │   └── users.py
-│   │   │   │   └── router.py    # v1 라우터 집합
-│   │   │   └── dependencies.py  # 공유 의존성 (인증 등)
-│   │   ├── core/                # 핵심 설정
-│   │   │   ├── config.py        # 환경변수 설정
-│   │   │   ├── security.py      # JWT, 비밀번호 해싱
-│   │   │   ├── database.py      # DB 엔진 & 세션
-│   │   │   ├── redis.py         # Redis 연결 & 세션
-│   │   │   ├── exceptions.py    # 커스텀 예외 계층
-│   │   │   ├── rate_limit.py    # Rate Limiting (slowapi)
-│   │   │   ├── logging.py       # structlog 초기 설정
-│   │   │   └── middleware.py    # RequestIdMiddleware
-│   │   ├── models/              # SQLAlchemy 모델
-│   │   │   ├── base.py          # Base, TimestampMixin
+│   │   │   ├── dependencies.py
+│   │   │   └── v1/
+│   │   │       ├── endpoints/
+│   │   │       │   ├── auth.py
+│   │   │       │   ├── admin_users.py
+│   │   │       │   ├── health.py
+│   │   │       │   └── users.py
+│   │   │       └── router.py
+│   │   ├── core/
+│   │   │   ├── config.py
+│   │   │   ├── database.py
+│   │   │   ├── exceptions.py
+│   │   │   ├── logging.py
+│   │   │   ├── redis.py
+│   │   │   └── security.py
+│   │   ├── models/
+│   │   │   ├── base.py
 │   │   │   └── user.py
-│   │   ├── schemas/             # Pydantic 스키마
-│   │   │   ├── auth.py
-│   │   │   ├── common.py        # PaginatedResponse 등 공통
-│   │   │   ├── error.py         # ErrorResponse 스키마
-│   │   │   └── user.py
-│   │   ├── services/            # 비즈니스 로직 계층
-│   │   │   ├── auth_service.py
-│   │   │   └── user_service.py
-│   │   ├── repositories/        # 데이터 접근 계층
-│   │   │   ├── base.py          # BaseRepository 제네릭
+│   │   ├── repositories/
 │   │   │   └── user_repository.py
-│   │   └── main.py              # FastAPI 엔트리포인트
-│   ├── alembic/                 # DB 마이그레이션
-│   │   ├── versions/
-│   │   └── env.py
-│   ├── tests/                   # pytest 테스트
-│   │   ├── conftest.py
-│   │   ├── test_auth.py
-│   │   ├── test_users.py
-│   │   ├── services/            # 서비스 단위 테스트
-│   │   └── repositories/        # 레포지토리 단위 테스트
-│   ├── alembic.ini
+│   │   ├── schemas/
+│   │   │   ├── auth.py
+│   │   │   ├── error.py
+│   │   │   └── user.py
+│   │   ├── services/
+│   │   │   ├── auth_service.py
+│   │   │   ├── admin_user_service.py
+│   │   │   └── google_oauth_service.py
+│   │   └── main.py
+│   ├── alembic/
+│   ├── tests/
 │   ├── pyproject.toml
-│   └── requirements.txt
-├── docker/                      # Docker 설정
-│   ├── frontend/
-│   │   └── Dockerfile
-│   └── backend/
-│       └── Dockerfile
-├── .github/
-│   └── workflows/
-│       ├── ci.yml               # PR 검증 워크플로우
-│       └── cd.yml               # 배포 워크플로우
-├── docker-compose.yml           # 개발 환경
-├── docker-compose.prod.yml      # 운영 환경
-├── .env.example                 # 환경변수 템플릿
-├── .pre-commit-config.yaml      # pre-commit 설정
-├── README.md                    # 프로젝트 소개 및 Quick Start
-├── ARCHITECTURE.md              # 아키텍처 문서 (본 문서)
-├── CONVENTIONS.md               # 공통 컨벤션
-├── CONVENTIONS-FRONTEND.md      # Frontend 규격
-├── CONVENTIONS-BACKEND.md       # Backend 규격
-├── SPECS-BACKEND.md             # Backend 참조 구현 코드
-├── SPECS-FRONTEND.md            # Frontend 참조 구현 코드
-├── AUTH.md                      # 인증/인가 통합 가이드
-└── CLAUDE.md                    # Claude Code 설정 및 AI 에이전트 규칙
+│   ├── uv.lock
+│   └── .env.example
+├── frontend/                     # Next.js 15 (pnpm)
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── (public)/
+│   │   │   │   └── login/
+│   │   │   │       └── page.tsx
+│   │   │   ├── (auth)/
+│   │   │   │   ├── layout.tsx
+│   │   │   │   ├── dashboard/
+│   │   │   │   │   └── page.tsx
+│   │   │   │   └── admin/
+│   │   │   │       └── users/
+│   │   │   │           └── page.tsx
+│   │   │   ├── api/
+│   │   │   │   ├── auth/
+│   │   │   │   │   ├── google/
+│   │   │   │   │   │   ├── login/
+│   │   │   │   │   │   │   └── route.ts
+│   │   │   │   │   │   └── callback/
+│   │   │   │   │   │       └── route.ts
+│   │   │   │   │   ├── refresh/
+│   │   │   │   │   │   └── route.ts
+│   │   │   │   │   ├── logout/
+│   │   │   │   │   │   └── route.ts
+│   │   │   │   │   └── test-login/
+│   │   │   │   │       └── route.ts
+│   │   │   │   └── [...path]/
+│   │   │   │       └── route.ts
+│   │   │   ├── globals.css
+│   │   │   ├── layout.tsx
+│   │   │   └── page.tsx
+│   │   ├── client/               # openapi-ts 자동 생성 (수동 수정 금지)
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── lib/
+│   │   ├── middleware.ts
+│   │   └── tests/
+│   ├── e2e/
+│   ├── openapi-ts.config.ts
+│   ├── package.json
+│   ├── pnpm-lock.yaml
+│   ├── playwright.config.ts
+│   ├── tsconfig.json
+│   ├── vitest.config.ts
+│   └── .env.example
+├── README.md
+├── ARCHITECTURE.md
+├── AUTH.md
+├── CONVENTIONS.md
+├── CONVENTIONS-FRONTEND.md
+├── CONVENTIONS-BACKEND.md
+├── SPECS-BACKEND.md
+├── SPECS-FRONTEND.md
+└── SPECS-INFRA.md
 ```
 
 ---
@@ -276,35 +263,21 @@ PostgreSQL / Redis               ← 데이터 저장소
 
 ## 6. 개발 환경
 
-Docker Compose 기반 개발 환경으로, Frontend/Backend/PostgreSQL/Redis 4개 서비스를 구성합니다.
+로컬 개발은 infra를 컨테이너로 띄우고(POSTGRES/REDIS), Frontend/Backend는 로컬 명령으로 실행합니다.
 
 | 서비스 | 포트 | 비고 |
 |--------|------|------|
-| frontend | 3000 | Hot Reload (소스 마운트) |
-| backend | 8000 | uvicorn `--reload` |
+| frontend | 3000 | `cd frontend && pnpm dev` |
+| backend | 8000 | `cd backend && uv run uvicorn app.main:app --reload` |
 | db | 5432 | PostgreSQL 16 |
 | redis | 6379 | Redis 7 |
 
-환경변수, Docker 설정, Hot Reload 상세는 [SPECS-INFRA.md](./SPECS-INFRA.md)를 참조하세요.
+infra 실행은 `docker compose -f infra/docker-compose.yml up -d`를 사용합니다.
+환경변수는 스택별 `.env.example`를 기준으로 관리합니다: `infra/.env.example`, `backend/.env.example`, `frontend/.env.example`.
 
 ---
 
 ## 7. 배포
 
-### Multi-stage Dockerfile
-
-Backend(`python:3.12-slim`)와 Frontend(`node:20-alpine`)는 Multi-stage 빌드로 개발/운영을 분리합니다.
-
-### 운영 환경
-
-`docker-compose.prod.yml`로 운영 환경을 구성합니다. 개발 환경과의 주요 차이:
-- `target: production` (빌드 스테이지)
-- 소스 마운트 없음 (이미지에 코드 포함)
-- 환경변수 외부 주입
-
-### CI/CD
-
-GitHub Actions로 PR 검증(lint, type-check, test, e2e)과 배포를 자동화합니다.
-
-Dockerfile, docker-compose, CI/CD 설정 파일의 참조 구현은 [SPECS-INFRA.md](./SPECS-INFRA.md)를 참조하세요.
-
+이 템플릿은 로컬 개발에 필요한 `infra/docker-compose.yml`(PostgreSQL/Redis)만 포함합니다.
+운영 배포(Dockerfile, reverse proxy, CI/CD 등)는 프로젝트 요구에 맞게 별도로 구성하세요.
