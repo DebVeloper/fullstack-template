@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -8,6 +7,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
+from app.core.alembic_config import resolve_database_url
 from app.models.base import Base
 from app.models.user import User  # noqa: F401
 
@@ -20,16 +20,7 @@ target_metadata = Base.metadata
 
 
 def get_database_url() -> str:
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        return database_url
-
-    configured_url = config.get_main_option("sqlalchemy.url")
-    if configured_url:
-        return configured_url
-
-    msg = "DATABASE_URL is required to run Alembic migrations"
-    raise RuntimeError(msg)
+    return resolve_database_url(config.get_main_option("sqlalchemy.url"))
 
 
 def run_migrations_offline() -> None:
